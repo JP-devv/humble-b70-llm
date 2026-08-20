@@ -1,7 +1,7 @@
 {
   "base_url": "http://127.0.0.1:19622",
   "model": "Qwen3.8-27B-UNC-G128-AR",
-  "tokenizer": "/data/models/Qwen3.8-27B-Uncensored-g128-AutoRound",
+  "tokenizer": "{MODEL_DIR}",
   "chat_template_kwargs": {
     "enable_thinking": false
   },

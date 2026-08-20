@@ -35,8 +35,16 @@ else
   envs+=(GPU_MEMORY_UTILIZATION=0.95)
 fi
 
+# runtime env (generic; see docs/drivers.md for the host-driver story)
+envs+=(VLLM_TARGET_DEVICE=xpu VLLM_XPU_ENABLE_XPU_GRAPH=1)
+envs+=(CCL_TOPO_P2P_ACCESS=0 CCL_ZE_IPC_EXCHANGE=pidfd CCL_ATL_TRANSPORT=ofi)
+envs+=(ZE_FLAT_DEVICE_HIERARCHY=COMPOSITE)
 # host-staged TP2 collectives (see docs/hardware.md — no P2P required)
-envs+=(VLLM_XPU_HOST_STAGED_COLLECTIVES=1 CCL_TOPO_P2P_ACCESS=0)
+envs+=(VLLM_XPU_HOST_STAGED_COLLECTIVES=1)
+# Distro libstdc++ note: some distro level-zero loaders need a newer
+# libstdc++.so.6 than the Python env bundles. If the server crashes at dlopen
+# with a GLIBCXX_3.4.x symbol error, export LD_PRELOAD to the system
+# libstdc++ (e.g. /usr/lib/x86_64-linux-gnu/libstdc++.so.6) before running.
 
 exec env "${envs[@]}" \
   "$HERE/.venv/bin/vllm" serve "$MODEL" \

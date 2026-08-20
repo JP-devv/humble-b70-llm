@@ -19,8 +19,7 @@ Measured effect (cold-strict contract):
 | --- | ---: | ---: |
 | TP2 FP16 head | 81.81 | — |
 | TP2 INT8 head | 94.58 | **+15.6%** |
-| TP1 FP16 head | 57.49 | — |
-| TP1 INT8 head | 66.84 | **+16.3%** |
+| TP1 INT8 head | 66.84 | (no TP1 FP16 run for this checkpoint; INT8 is the shipped single-card mode) |
 
 Implementation notes: quantization runs at load in row-chunks (a single
 full-head `float()` copy is a 5 GB transient that OOMs a single card), the

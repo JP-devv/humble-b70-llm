@@ -31,17 +31,25 @@ fi
 git -C src/vllm-xpu-kernels apply --check "$HERE/patches/vllm-xpu-kernels/"*.patch 2>/dev/null || true
 git -C src/vllm-xpu-kernels apply "$HERE/patches/vllm-xpu-kernels/"*.patch 2>/dev/null || true
 
-# 3. venv
+# 3. venv + torch (Intel XPU wheels; an extra index is required)
 uv venv --python 3.12 .venv
+"$HERE/.venv/bin/pip" install --extra-index-url \
+  https://pytorch-extension.intel.com/release-whl/stable/xpu/us/ \
+  "torch==2.13.0+xpu"
 
 # 4. kernels wheel (source build; see docs/drivers.md for toolchain)
+#    - oneAPI compiler on PATH (source setvars.sh or install via apt)
+#    - the reduced attention presets avoid compiling unused template variants
+#      (and their 7-12 GB compiler peaks)
+#    - MAX_JOBS defaults to 6; lower it on lower-RAM hosts (fat units can OOM)
 export MAX_JOBS="${MAX_JOBS:-6}"
 export VLLM_CHUNK_PREFILL_CONFIG=chunk_prefill_default.conf
 export VLLM_PAGED_DECODE_CONFIG=paged_decode_default.conf
+"$HERE/.venv/bin/pip" install numpy "cmake==3.31.8" ninja \
+  "setuptools>=77,<80" setuptools-scm wheel build
 (cd src/vllm-xpu-kernels && \
-  UV="$(command -v uv)" "$HERE/.venv/bin/python" -m pip wheel \
-    --no-build-isolation --no-deps -w "$HERE/dist" . 2>/dev/null || \
-  "$HERE/.venv/bin/python" setup.py bdist_wheel --dist-dir "$HERE/dist" --py-limited-api=cp38)
+  "$HERE/.venv/bin/python" setup.py bdist_wheel \
+    --dist-dir "$HERE/dist" --py-limited-api=cp38)
 
 # 5. install vLLM (editable) + kernels wheel
 "$HERE/.venv/bin/pip" install --no-build-isolation -e src/vllm

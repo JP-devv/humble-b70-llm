@@ -1,5 +1,5 @@
 diff --git a/vllm/compilation/cuda_graph.py b/vllm/compilation/cuda_graph.py
-index b63d86199..faa4ccc0c 100644
+index b63d86199..44fe9027d 100644
 --- a/vllm/compilation/cuda_graph.py
 +++ b/vllm/compilation/cuda_graph.py
 @@ -2,6 +2,7 @@
@@ -133,7 +133,7 @@ index b63d86199..faa4ccc0c 100644
          # streams, it might not be safe to share a global pool.
          # only investigate this when we use multiple streams
 -        self.graph_pool = current_platform.get_global_graph_pool()
-+        # HAXOR: separate-pool experiment. XPU graph-pool sharing across
++        # (experiment): separate-pool. XPU graph-pool sharing across
 +        # pieces corrupts batched replay; give each graph its own pool.
 +        if os.environ.get("VLLM_XPU_SEPARATE_GRAPH_POOLS", "0") == "1":
 +            self.graph_pool = None
@@ -438,7 +438,7 @@ index 7ca132824..98c23d67f 100644
 +    _wrap_reduce_scatter_tensor()
 +    logger.info("host-staged functional collectives installed")
 diff --git a/vllm/model_executor/layers/vocab_parallel_embedding.py b/vllm/model_executor/layers/vocab_parallel_embedding.py
-index 79695084e..6361522bc 100644
+index 79695084e..8bf990f61 100644
 --- a/vllm/model_executor/layers/vocab_parallel_embedding.py
 +++ b/vllm/model_executor/layers/vocab_parallel_embedding.py
 @@ -1,6 +1,7 @@
@@ -539,7 +539,7 @@ index 79695084e..6361522bc 100644
 +        # transient per-output-channel INT8 copy. It is default-off and must pass
 +        # the quality gate before being treated as a candidate result.
 +        with torch.no_grad():
-+            # haxor: chunk the row loop — the fork's single float() shot is a
++            # chunk the row loop — a single float() shot is a
 +            # 5 GB transient per head, which OOMs a single-card (TP1) load
 +            # where the head is unsharded (2.54 GB full vocab per card).
 +            num_rows, hidden = weight.shape
@@ -737,7 +737,7 @@ index 79695084e..6361522bc 100644
 +            and hasattr(layer, "_xpu_lm_head_int4_scale")
 +            and hasattr(layer, "_xpu_lm_head_int4_qzeros")
 +        ):
-+            # haxor port (from record fork): draft lm_head as RTN INT4 g128
++            # draft lm_head as RTN INT4 g128
 +            # through oneDNN int4_gemm_w4a16. Draft logits only steer token
 +            # proposals; the FP16/INT8 target head still verifies.
 +            x_contiguous = x if x.is_contiguous() else x.contiguous()
@@ -780,7 +780,7 @@ index 79695084e..6361522bc 100644
 +            and hasattr(layer, "_xpu_lm_head_int8_weight_t")
 +            and hasattr(layer, "_xpu_lm_head_int8_scale")
 +        ):
-+            # haxor port (from steve fork): W8A8 INT8 lm_head. The 2.54 GB
++            # W8A8 INT8 lm_head: the 2.54 GB
 +            # FP16 vocab GEMM is read on every draft step and every verify;
 +            # INT8 halves the single biggest per-step weight read.
 +            x_contiguous = x if x.is_contiguous() else x.contiguous()
@@ -798,7 +798,7 @@ index 79695084e..6361522bc 100644
  
      def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
 diff --git a/vllm/model_executor/models/qwen3_5_mtp.py b/vllm/model_executor/models/qwen3_5_mtp.py
-index 67f06f4f5..24a97817c 100644
+index 67f06f4f5..1fea15f3a 100644
 --- a/vllm/model_executor/models/qwen3_5_mtp.py
 +++ b/vllm/model_executor/models/qwen3_5_mtp.py
 @@ -4,6 +4,7 @@
@@ -829,7 +829,7 @@ index 67f06f4f5..24a97817c 100644
                  quant_config=self.quant_config,
                  prefix=maybe_prefix(prefix, "lm_head"),
              )
-+            # haxor: mark the draft head so the INT4 draft-lm_head hook can
++            # mark the draft head so the INT4 draft-lm_head hook can
 +            # distinguish it from the target head (_vllm_prefix is not
 +            # populated at process_weights_after_loading time in this build).
 +            self.lm_head._hx_is_draft_head = True

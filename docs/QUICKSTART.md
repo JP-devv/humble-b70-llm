@@ -28,11 +28,9 @@ Native path (what the reference machine runs):
 bash scripts/build.sh               # venv + apply patches + build kernels wheel
 ```
 
-Container path (optional, once validated; GHCR image planned):
-
-```bash
-docker build -t humble-b70 .        # see scripts/build-image.sh
-```
+Container path: not yet provided. The native path above is the
+authoritative, tested one; a Dockerfile/GHCR image is planned but is not
+something we ship claims about until it is built and validated.
 
 ## 3. Model
 
