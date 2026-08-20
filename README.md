@@ -113,9 +113,7 @@ gate, with the same number you can re-derive from the reference JSONs.
 
 | Result (tok/s, cold) | Minimum hardware | Notes |
 | --- | --- | --- |
-| 94.58 (TP2 INT8) | 2x B70 32 GB + ReBAR | Second slot can be PCIe x4 or x16 — the reference machine runs the
-  second card at x4 and reproduces this row. Same host minimums as below.
-  No peer-to-peer required. |
+| 94.58 (TP2 INT8) | 2x B70 32 GB + ReBAR | Second slot can be PCIe x4 or x16 — the reference machine runs the second card at x4 and reproduces this row. Same host minimums as below. No peer-to-peer required. |
 | 81.81 (TP2 FP16) | 2x B70 32 GB + ReBAR | Same as above; difference is only the `INT8=off` flag. |
 | 66.84 (TP1 INT8) | 1x B70 32 GB + ReBAR | Any working PCIe slot. Complete, supported configuration. |
 
