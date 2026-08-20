@@ -74,13 +74,35 @@ gate, with the same number you can re-derive from the reference JSONs.
 
 ## Hardware notes (read before buying/borrowing)
 
-- The reference machine: two Intel Arc Pro B70 (32 GB) cards, full-size
-  ReBAR, PCIe 5.0 x16.
+### Minimum requirements per result
+
+| Result (tok/s) | Minimum hardware | Notes |
+| --- | --- | --- |
+| 94.58 (TP2 INT8) | 2x B70 32 GB + ReBAR | Second slot can be PCIe x4 or x16 — the reference machine runs the
+  second card at x4 and reproduces this row. Same host minimums as below.
+  No peer-to-peer required. |
+| 81.81 (TP2 FP16) | 2x B70 32 GB + ReBAR | Same as above; difference is only the `INT8=off` flag. |
+| 66.84 (TP1 INT8) | 1x B70 32 GB + ReBAR | Any working PCIe slot. Complete, supported configuration. |
+
+Host minimums for **building and reproducing** any row (in addition to the
+single listed GPU):
+
+- **OS:** Ubuntu-family Linux (26.04 tested; Debian-family likely).
+- **RAM:** 64 GB recommended; the SYCL kernel build peaks at 7-12 GB per
+  compile job (6 jobs by default). 32 GB works with `MAX_JOBS=3` and the
+  reduced attention presets but is not validated in this repo.
+- **Disk:** ~90 GB free (toolchain + 18 GB model + build tree).
+- **Driver:** a Battlemage-capable `xe` kernel line + Intel compute runtime
+  (exact versions and verification in [docs/drivers.md](docs/drivers.md)).
+- **GPU:** Arc Pro B70 (32 GB) is the only verified GPU. Other Arc/XPU
+  variants are unverified and will not necessarily reproduce these rows.
+
+### Notes
+
 - **No GPU peer-to-peer required.** TP2 works via host-staged collectives
   (in the patch set) on motherboards without P2P routing. With working
   peer IPC the same patches run faster; without it, they still run and
   reproduce.
-- One card is a complete, supported configuration (66.84 tok/s).
 - See [docs/hardware.md](docs/hardware.md) for the full truth table,
   BIOS/ReBAR requirements, and power findings.
 

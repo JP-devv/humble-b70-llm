@@ -11,6 +11,17 @@
 The single-card configuration is complete and supported: TP1 + MTP3 +
 INT8 head = 66.84 tok/s (see README).
 
+## Host minimums (to build and reproduce any row)
+
+| Resource | Minimum | Why |
+| --- | --- | --- |
+| CPU | any x86-64 | compile-bound, not runtime-bound |
+| RAM | 64 GB recommended; 32 GB with MAX_JOBS=3 + reduced attention presets (unvalidated) | SYCL AOT units peak 7-12 GB each; the build runs 6 jobs by default |
+| Disk | ~90 GB | toolchain + 18 GB model + build tree |
+| OS | Ubuntu-family (26.04 tested) | driver packages and oneAPI toolchain target Debian derivatives |
+| Driver | Battlemage-capable `xe` kernel + Intel compute runtime | see docs/drivers.md for pinning and verification |
+| GPU | **Arc Pro B70 (32 GB) only — verified** | other Arc/XPU variants are unverified; the model + fp8/FP16 KV need 32 GB VRAM |
+
 ## Reference two-card configuration
 
 - Two Intel Arc Pro B70, 32 GB each.
