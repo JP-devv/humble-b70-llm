@@ -69,7 +69,7 @@ gate, with the same number you can re-derive from the reference JSONs.
    benchmark of this stack reads much higher than a cold fresh-response
    number — the difference is the measurement, not the machine. The
    [metrics contract](docs/metrics-contract.md) and
-   [methodology lesson](bench/reference/warm-vs-cold-methodology-lesson.json)
+   [methodology lesson](bench/reference/methodology-lesson-alternative-stack-cold.json)
    make that difference explicit instead of hidden.
 
 ## Hardware notes (read before buying/borrowing)

@@ -52,7 +52,7 @@ evidence JSONs are in `bench/reference/` with `-REJECTED` in the name.
    under their own conditions, but they describe repeat traffic, not fresh
    requests. The methodology lesson evidence file walks through the same
    stack under both protocols.
-   Evidence: `warm-vs-cold-methodology-lesson.json`.
+   Evidence: `methodology-lesson-alternative-stack-cold.json`.
 
 4. **Chasing record-class TP2 numbers on a host without GPU peer IPC** —
    the +20%+ gap to a stack that captures collectives inside graphs comes
