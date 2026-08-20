@@ -8,28 +8,63 @@ The goal of this repository is that a stranger who clones it, reads it, and
 follows `QUICKSTART.md` lands on the same numbers we publish — not because of
 faith, but because everything that affects the result is pinned or measured.
 
-## Headline results
+## LocalMaxxing-approved speeds (headline)
+
+Decode rate as measured by the LocalMaxxing platform (their protocol —
+warm-up request, then a median of 3 greedy iterations, client post-first):
+
+| Config | Decode (tok/s) | TTFT | tokSPrefill | Submission |
+| --- | ---: | ---: | ---: | --- |
+| **TP2 — 2x Intel Arc Pro B70** | **136.4** | 841 ms | 755 | `cmt0vu76q0fvtms017exhssx9` APPROVED |
+| **TP1 — 1x Intel Arc Pro B70** | **97.8** | 356 ms | 1782 | `cmt0vrxjk0fvpms01n4i9cmns` APPROVED |
+
+<p>
+  <img src="docs/assets/localmaxxing-tp2.png" alt="TP2 136.4 tok/s LocalMaxxing approved" width="45%">
+  <img src="docs/assets/localmaxxing-tp1.png" alt="TP1 97.8 tok/s LocalMaxxing approved" width="45%">
+</p>
 
 Model: `johannrplaster/Qwen3.8-27B-Uncensored-int4-AutoRound`
 (Qwen3.8-27B uncensored variant, AutoRound INT4 W4A16 g128, MTP head
-preserved, linear-attention projections kept FP16).
+preserved, linear-attention projections kept FP16). Stack: MTP3 speculative
+decode, FP16 KV, load-time **INT8 W8A8 lm_head**, host-staged TP2 collectives
+(no peer-to-peer required).
 
-Decode rate, measured with the in-repo harness under the
-[metrics contract](docs/metrics-contract.md) (cold, one-shot, cache-zero,
-median tokens 1-100 after TTFT):
+The platform protocol measures warm, repeating traffic. A stricter, one-shot
+picture of the same stack — what a fresh user request actually experiences —
+is under the [cold workload speeds](#cold-workload-speeds-strict-one-shot-protocol)
+below.
 
-| Serving config | Decode (tok/s) | Evidence |
+## Cold workload speeds (strict one-shot protocol)
+
+The same stack measured cold: each prompt sent once, prompt/KV caching off,
+`cached_tokens=0` verified, median inter-token rate over tokens 1-100 after
+TTFT (the in-repo harness, contract in
+[docs/metrics-contract.md](docs/metrics-contract.md)).
+
+<img src="docs/assets/localmaxxing-speeds.svg" alt="warm vs cold decode speeds">
+
+| Serving config | Decode (tok/s, cold) | Evidence |
 | --- | ---: | --- |
 | 2x B70 (TP2), MTP3, FP16 KV, **INT8 LM head** | **94.58** | [json](bench/reference/tp2-mtp3-int8-head-94.58.json) |
 | 2x B70 (TP2), MTP3, FP16 KV, stock FP16 head | 81.81 | [json](bench/reference/tp2-mtp3-fp16-head-81.81.json) |
 | 1x B70, MTP3, FP16 KV, **INT8 LM head** | **66.84** | [json](bench/reference/tp1-mtp3-int8-head-66.84.json) |
 
-The INT8 LM head (W8A8, quantized at load) is the headline optimization:
+The INT8 LM head (W8A8, quantized at load) is the key optimization:
 **+15.6% decode with quality gates unchanged.** How and why it works is in
 [docs/optimizations.md](docs/optimizations.md) — including the things that
 did *not* work and were rejected with data.
 
+Why the two classes differ: warm, repeated, same-shape requests let clocks,
+allocators, and graph dispatch reach steady state; cold requests pay
+first-touch costs. Both numbers are real; they describe different traffic.
+The [metrics contract](docs/metrics-contract.md) makes the boundary explicit.
+
 ## Quickstart (target: ~45 minutes to a verified server)
+
+(Reproduction target is the cold row: `94.58 ± tolerance` TP2 / `66.84` TP1
+via `bash scripts/bench-strict.sh`; the LocalMaxxing rows above come from the
+platform's own warmed protocol and are re-verifiable with the `lmx` CLI
+against the same server.)
 
 ```bash
 # 1. host drivers (one-time, needs sudo + reboot on some systems)
@@ -74,9 +109,9 @@ gate, with the same number you can re-derive from the reference JSONs.
 
 ## Hardware notes (read before buying/borrowing)
 
-### Minimum requirements per result
+### Minimum requirements per result (cold-workload rows, same hardware serves the LocalMaxxing rows)
 
-| Result (tok/s) | Minimum hardware | Notes |
+| Result (tok/s, cold) | Minimum hardware | Notes |
 | --- | --- | --- |
 | 94.58 (TP2 INT8) | 2x B70 32 GB + ReBAR | Second slot can be PCIe x4 or x16 — the reference machine runs the
   second card at x4 and reproduces this row. Same host minimums as below.

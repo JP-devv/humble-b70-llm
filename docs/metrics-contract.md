@@ -1,8 +1,13 @@
 # Metrics contract
 
-Every number published in the README obeys this contract. If you measure
-with different conditions, your number is different — that is expected and
-does not mean the hardware differs.
+The repository publishes two labeled number classes. Rows labeled
+**cold workload** — the evidence in `bench/reference/` and the cold tables in
+the README — obey this strict contract. Rows labeled **LocalMaxxing-approved**
+follow the platform's own protocol (warm-up request + median of 3 greedy
+iterations, client post-first) and are not held to this contract; they are
+displayed separately and never mixed with cold rows. If you measure with
+different conditions, your number is different — that is expected and does
+not mean the hardware differs.
 
 ## Decode metric (primary)
 
