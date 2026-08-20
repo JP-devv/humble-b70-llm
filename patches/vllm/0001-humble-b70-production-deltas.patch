@@ -1,0 +1,1088 @@
+diff --git a/vllm/compilation/cuda_graph.py b/vllm/compilation/cuda_graph.py
+index b63d86199..faa4ccc0c 100644
+--- a/vllm/compilation/cuda_graph.py
++++ b/vllm/compilation/cuda_graph.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ import dataclasses
++import os
+ import weakref
+ from collections import Counter
+ from collections.abc import Callable
+@@ -28,6 +29,108 @@ from vllm.utils.torch_utils import current_stream, weak_ref_tensors
+ 
+ logger = init_logger(__name__)
+ 
++_GRAPH_DUMP = os.environ.get("VLLM_XPU_GRAPH_DUMP", "0") == "1"
++_GRAPH_DUMP_DIR = os.environ.get("VLLM_XPU_GRAPH_DUMP_PATH", "/tmp/gdump")
++_GRAPH_DUMP_INST = [0]
++_GRAPH_DUMP_SEQ = [0]
++_GRAPH_DUMP_SEEN = set()
++
++
++def _dump_replay(inst_id, entry, args, kwargs, runnable, output_after):
++    if not _GRAPH_DUMP:
++        return
++    num_tokens = entry.batch_descriptor.num_tokens
++    key = (inst_id, num_tokens)
++    if key in _GRAPH_DUMP_SEEN:
++        return
++    _GRAPH_DUMP_SEEN.add(key)
++    _GRAPH_DUMP_SEQ[0] += 1
++    seq = _GRAPH_DUMP_SEQ[0]
++    os.makedirs(_GRAPH_DUMP_DIR, exist_ok=True)
++
++    def summarize(x):
++        if isinstance(x, torch.Tensor):
++            small = x.numel() <= 5120 * 16
++            return {
++                "kind": "tensor",
++                "shape": list(x.shape),
++                "dtype": str(x.dtype),
++                "full": x.detach().float().cpu() if small else None,
++                "mean": float(x.detach().float().mean()) if not small else None,
++                "std": float(x.detach().float().std()) if not small else None,
++                "absmax": float(x.detach().float().abs().max()) if not small else None,
++                "first8": x.detach().flatten()[:8].float().cpu().tolist() if not small else None,
++            }
++        if isinstance(x, (list, tuple)):
++            return [summarize(v) for v in x]
++        if isinstance(x, dict):
++            return {k: summarize(v) for k, v in x.items()}
++        return {"kind": type(x).__name__, "val": str(x)}
++
++    # Compute eager reference for the same inputs to detect graph-replay bugs.
++    eager_output = None
++    try:
++        with torch.no_grad():
++            eager_output = runnable(*args, **kwargs)
++    except Exception as e:  # noqa: BLE001
++        eager_output = {"error": str(e)}
++
++    payload = {
++        "seq": seq,
++        "inst": inst_id,
++        "num_tokens": num_tokens,
++        "args": summarize(args),
++        "kwargs": summarize(kwargs),
++        "output": summarize(output_after),
++        "eager_output": summarize(eager_output),
++    }
++    path = os.path.join(_GRAPH_DUMP_DIR, f"r{seq:05d}_inst{inst_id}_b{num_tokens}.pt")
++    torch.save(payload, path)
++    print(f"GRAPH_DUMP seq={seq} inst={inst_id} b={num_tokens} -> {path}", flush=True)
++
++
++def _dump_capture(inst_id, entry, args, kwargs, output, runnable):
++    num_tokens = entry.batch_descriptor.num_tokens
++    os.makedirs(_GRAPH_DUMP_DIR, exist_ok=True)
++
++    def summarize(x):
++        if isinstance(x, torch.Tensor):
++            small = x.numel() <= 5120 * 16
++            return {
++                "kind": "tensor",
++                "shape": list(x.shape),
++                "dtype": str(x.dtype),
++                "full": x.detach().float().cpu() if small else None,
++                "mean": float(x.detach().float().mean()) if not small else None,
++                "std": float(x.detach().float().std()) if not small else None,
++                "absmax": float(x.detach().float().abs().max()) if not small else None,
++            }
++        if isinstance(x, (list, tuple)):
++            return [summarize(v) for v in x]
++        if isinstance(x, dict):
++            return {k: summarize(v) for k, v in x.items()}
++        return {"kind": type(x).__name__, "val": str(x)}
++
++    # Re-run eagerly (outside capture) to get the reference output for the
++    # capture-time inputs.
++    eager = None
++    try:
++        with torch.no_grad():
++            eager = runnable(*args, **kwargs)
++    except Exception as e:  # noqa: BLE001
++        eager = {"error": str(e)}
++
++    payload = {
++        "inst": inst_id,
++        "num_tokens": num_tokens,
++        "args": summarize(args),
++        "capture_output": summarize(output),
++        "eager_output": summarize(eager),
++    }
++    path = os.path.join(_GRAPH_DUMP_DIR, f"c{inst_id}_b{num_tokens}.pt")
++    torch.save(payload, path)
++    print(f"GRAPH_DUMP_CAPTURE inst={inst_id} b={num_tokens} -> {path}", flush=True)
++
+ 
+ @dataclasses.dataclass(frozen=True)
+ class CUDAGraphStat:
+@@ -139,7 +242,7 @@ class CUDAGraphEntry:
+ class CUDAGraphOptions:
+     debug_log_enable: bool = True
+     gc_disable: bool = False
+-    weak_ref_output: bool = True
++    weak_ref_output: bool = False
+ 
+ 
+ class CUDAGraphWrapper:
+@@ -197,7 +300,12 @@ class CUDAGraphWrapper:
+         # TODO: in the future, if we want to use multiple
+         # streams, it might not be safe to share a global pool.
+         # only investigate this when we use multiple streams
+-        self.graph_pool = current_platform.get_global_graph_pool()
++        # HAXOR: separate-pool experiment. XPU graph-pool sharing across
++        # pieces corrupts batched replay; give each graph its own pool.
++        if os.environ.get("VLLM_XPU_SEPARATE_GRAPH_POOLS", "0") == "1":
++            self.graph_pool = None
++        else:
++            self.graph_pool = current_platform.get_global_graph_pool()
+ 
+         if cudagraph_options is None:
+             cudagraph_options = CUDAGraphOptions()
+@@ -205,6 +313,8 @@ class CUDAGraphWrapper:
+         # the entries for different batch descriptors that we need to capture
+         # cudagraphs for.
+         self.concrete_cudagraph_entries: dict[BatchDescriptor, CUDAGraphEntry] = {}
++        self._dump_inst_id = _GRAPH_DUMP_INST[0]
++        _GRAPH_DUMP_INST[0] += 1
+ 
+         CUDAGraphWrapper._all_instances.add(self)
+ 
+@@ -336,6 +446,9 @@ class CUDAGraphWrapper:
+             entry.output = weak_ref_tensors(output)
+             entry.cudagraph = cudagraph
+ 
++            if _GRAPH_DUMP:
++                _dump_capture(self._dump_inst_id, entry, args, kwargs, output, self.runnable)
++
+             compilation_counter.num_cudagraph_captured += 1
+ 
+             # important: we need to return the output, rather than
+@@ -358,4 +471,5 @@ class CUDAGraphWrapper:
+         # from pre-capture prefetches are satisfied.
+         get_offloader().sync_prev_onload()
+         entry.cudagraph.replay()
++        _dump_replay(self._dump_inst_id, entry, args, kwargs, self.runnable, entry.output)
+         return entry.output
+diff --git a/vllm/distributed/device_communicators/xpu_communicator.py b/vllm/distributed/device_communicators/xpu_communicator.py
+index 7ca132824..98c23d67f 100644
+--- a/vllm/distributed/device_communicators/xpu_communicator.py
++++ b/vllm/distributed/device_communicators/xpu_communicator.py
+@@ -2,6 +2,8 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ 
++import os
++
+ import torch
+ import torch.distributed as dist
+ from torch.distributed import ProcessGroup
+@@ -12,6 +14,16 @@ from .base_device_communicator import DeviceCommunicatorBase
+ 
+ logger = init_logger(__name__)
+ 
++# Host-staged collectives for XPU TP on hosts where cross-device VRAM IPC is
++# unavailable (GPUs on separate PCIe root ports: zeMemOpenIpcHandle fails with
++# ZE_RESULT_ERROR_INVALID_ARGUMENT for cross-device handles). Payloads at or
++# above VLLM_XPU_HOST_STAGED_MIN_BYTES are bounced through pinned host memory
++# over the CPU (gloo) group; small payloads stay on the native device path.
++_HOST_STAGED = os.environ.get("VLLM_XPU_HOST_STAGED_COLLECTIVES", "0") == "1"
++_HOST_STAGED_MIN_BYTES = int(
++    os.environ.get("VLLM_XPU_HOST_STAGED_MIN_BYTES", str(1 * 1024 * 1024))
++)
++
+ 
+ class XpuCommunicator(DeviceCommunicatorBase):
+     def __init__(
+@@ -26,6 +38,7 @@ class XpuCommunicator(DeviceCommunicatorBase):
+             cpu_group, device, device_group, unique_name, use_all2all=use_all2all
+         )
+         self.ca_comm: None = None
++        self._init_host_staging()
+         if self.use_all2all:
+             if self.all2all_backend in ("naive", "allgather_reducescatter"):
+                 from .all2all import AgRsAll2AllManager
+@@ -45,8 +58,57 @@ class XpuCommunicator(DeviceCommunicatorBase):
+                 self.all2all_manager = AgRsAll2AllManager(self.cpu_group)
+                 logger.info("Using AgRs manager on XPU device.")
+ 
++    def _init_host_staging(self):
++        self._staging_cache: dict = {}
++        if _HOST_STAGED:
++            logger.info(
++                "XpuCommunicator: host-staged collectives enabled "
++                "(threshold=%d bytes)",
++                _HOST_STAGED_MIN_BYTES,
++            )
++
++    def _needs_staging(self, t: torch.Tensor) -> bool:
++        return (
++            _HOST_STAGED
++            and t.numel() * t.element_size() >= _HOST_STAGED_MIN_BYTES
++        )
++
++    def _pinned(self, shape, dtype) -> torch.Tensor:
++        key = (tuple(shape), dtype)
++        buf = self._staging_cache.get(key)
++        if buf is None:
++            buf = torch.empty(shape, dtype=dtype, pin_memory=True)
++            self._staging_cache[key] = buf
++        return buf
++
++    def _staged_all_reduce(self, output: torch.Tensor) -> torch.Tensor:
++        buf = self._pinned(output.shape, output.dtype)
++        buf.copy_(output, non_blocking=False)
++        dist.all_reduce(buf, group=self.cpu_group)
++        output.copy_(buf, non_blocking=False)
++        return output
++
++    def _staged_all_gather(self, output: torch.Tensor,
++                           input_: torch.Tensor) -> None:
++        inbuf = self._pinned(input_.shape, input_.dtype)
++        inbuf.copy_(input_, non_blocking=False)
++        outbuf = self._pinned((self.world_size,) + tuple(inbuf.shape),
++                              input_.dtype)
++        dist.all_gather(list(outbuf.unbind(0)), inbuf, group=self.cpu_group)
++        output.copy_(outbuf.reshape(output.shape), non_blocking=False)
++
++    def _staged_reduce_scatter(self, output: torch.Tensor,
++                               input_: torch.Tensor) -> None:
++        inbuf = self._pinned(input_.shape, input_.dtype)
++        inbuf.copy_(input_, non_blocking=False)
++        outbuf = self._pinned(output.shape, output.dtype)
++        dist.reduce_scatter_tensor(outbuf, inbuf, group=self.cpu_group)
++        output.copy_(outbuf, non_blocking=False)
++
+     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+         output = input_.clone()
++        if self._needs_staging(output):
++            return self._staged_all_reduce(output)
+         dist.all_reduce(output, group=self.device_group)
+         return output
+ 
+@@ -69,7 +131,11 @@ class XpuCommunicator(DeviceCommunicatorBase):
+             output_shape, dtype=input_tensor.dtype, device=input_tensor.device
+         )
+ 
+-        dist.reduce_scatter_tensor(output, input_tensor, group=self.device_group)
++        if self._needs_staging(input_tensor):
++            self._staged_reduce_scatter(output, input_tensor)
++        else:
++            dist.reduce_scatter_tensor(output, input_tensor,
++                                       group=self.device_group)
+ 
+         # Reshape before returning
+         return output.movedim(0, dim).contiguous()
+@@ -99,7 +165,9 @@ class XpuCommunicator(DeviceCommunicatorBase):
+         output = torch.empty(
+             output_shape, dtype=input_tensor.dtype, device=input_tensor.device
+         )
+-        if sizes is not None and sizes.count(sizes[0]) != len(sizes):
++        if self._needs_staging(input_tensor):
++            self._staged_reduce_scatter(output, input_tensor)
++        elif sizes is not None and sizes.count(sizes[0]) != len(sizes):
+             # if inputs shape in different ranks is not the same using reduce_scatter
+             input_splits = list(input_tensor.split(sizes, dim=0))
+             dist.reduce_scatter(output, input_splits, group=self.device_group)
+@@ -138,7 +206,9 @@ class XpuCommunicator(DeviceCommunicatorBase):
+                 output_size, dtype=input_.dtype, device=input_.device
+             )
+ 
+-            if sizes is not None:
++            if self._needs_staging(input_):
++                self._staged_all_gather(output_tensor, input_)
++            elif sizes is not None:
+                 all_gather_list = []
+                 for size in sizes:
+                     all_gather_list.append(
+@@ -179,7 +249,11 @@ class XpuCommunicator(DeviceCommunicatorBase):
+             (self.world_size,) + input_size, dtype=input_.dtype, device=input_.device
+         )
+         # All-gather.
+-        dist.all_gather_into_tensor(output_tensor, input_, group=self.device_group)
++        if self._needs_staging(input_):
++            self._staged_all_gather(output_tensor, input_)
++        else:
++            dist.all_gather_into_tensor(output_tensor, input_,
++                                        group=self.device_group)
+         if self.rank_in_group == dst:
+             # Reshape
+             output_tensor = output_tensor.movedim(0, dim)
+@@ -193,7 +267,15 @@ class XpuCommunicator(DeviceCommunicatorBase):
+         return output_tensor
+ 
+     def broadcast(self, input_: torch.Tensor, src: int = 0) -> None:
+-        dist.broadcast(input_, src=src, group=self.device_group)
++        if self._needs_staging(input_):
++            buf = self._pinned(input_.shape, input_.dtype)
++            if self.rank_in_group == src:
++                buf.copy_(input_, non_blocking=False)
++            dist.broadcast(buf, src=src, group=self.cpu_group)
++            if self.rank_in_group != src:
++                input_.copy_(buf, non_blocking=False)
++        else:
++            dist.broadcast(input_, src=src, group=self.device_group)
+ 
+     def dispatch_router_logits(
+         self,
+@@ -254,3 +336,108 @@ class XpuCommunicator(DeviceCommunicatorBase):
+             hidden_states,
+             is_sequence_parallel,
+         )
++
++# --- Host-staged functional collectives -------------------------------------
++# The MTP proposer's hidden-state all-gather is traced by inductor and reaches
++# torch.distributed's python collectives directly, bypassing XpuCommunicator.
++# Wrap the python entry points so large XPU payloads are staged through pinned
++# host memory over the default group's CPU (gloo) backend. TP-only deployments
++# have TP group == WORLD, which is what the staged path uses.
++if _HOST_STAGED:
++    import torch.distributed.distributed_c10d as _c10d
++
++    _pg_world = None
++
++    def _stage_guard(t):
++        return (
++            isinstance(t, torch.Tensor)
++            and t.device.type == "xpu"
++            and t.numel() * t.element_size() >= _HOST_STAGED_MIN_BYTES
++        )
++
++    _cpu_group_cache = None
++
++    def _resolve_cpu_group(group):
++        # The device (xccl) group cannot carry CPU tensors; use the matching
++        # GroupCoordinator's gloo sibling instead.
++        global _cpu_group_cache
++        if _cpu_group_cache is not None:
++            return _cpu_group_cache
++        from vllm.distributed import get_tp_group, get_world_group
++        for gc in (get_tp_group(), get_world_group()):
++            dg = getattr(gc, "device_group", None)
++            if group is None or dg is None or group is dg:
++                _cpu_group_cache = gc.cpu_group
++                return _cpu_group_cache
++        _cpu_group_cache = get_world_group().cpu_group
++        return _cpu_group_cache
++
++    def _wrap_unary(name):
++        orig = getattr(_c10d, name)
++        def wrapped(tensor, *args, **kwargs):
++            if _stage_guard(tensor):
++                cpu = tensor.detach().to("cpu", copy=True)
++                kwargs["group"] = _resolve_cpu_group(kwargs.pop("group", None))
++                orig(cpu, *args, **kwargs)
++                tensor.copy_(cpu, non_blocking=False)
++                return None
++            return orig(tensor, *args, **kwargs)
++        setattr(_c10d, name, wrapped)
++        setattr(dist, name, wrapped)
++
++    def _wrap_all_gather_into_tensor():
++        name = "all_gather_into_tensor"
++        orig = getattr(_c10d, name)
++        def wrapped(output, input_, *args, **kwargs):
++            if _stage_guard(input_) or _stage_guard(output):
++                cpu_in = input_.detach().to("cpu", copy=True)
++                cpu_out = torch.empty(
++                    (output.shape), dtype=output.dtype, pin_memory=True)
++                kwargs["group"] = _resolve_cpu_group(kwargs.pop("group", None))
++                orig(cpu_out, cpu_in, *args, **kwargs)
++                output.copy_(cpu_out, non_blocking=False)
++                return None
++            return orig(output, input_, *args, **kwargs)
++        setattr(_c10d, name, wrapped)
++        setattr(dist, name, wrapped)
++
++    def _wrap_all_gather():
++        name = "all_gather"
++        orig = getattr(_c10d, name)
++        def wrapped(tensor_list, tensor, *args, **kwargs):
++            if _stage_guard(tensor):
++                cpu_in = tensor.detach().to("cpu", copy=True)
++                cpu_list = [
++                    torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
++                    for t in tensor_list
++                ]
++                kwargs["group"] = _resolve_cpu_group(kwargs.pop("group", None))
++                orig(cpu_list, cpu_in, *args, **kwargs)
++                for t, c in zip(tensor_list, cpu_list):
++                    t.copy_(c, non_blocking=False)
++                return None
++            return orig(tensor_list, tensor, *args, **kwargs)
++        setattr(_c10d, name, wrapped)
++        setattr(dist, name, wrapped)
++
++    def _wrap_reduce_scatter_tensor():
++        name = "reduce_scatter_tensor"
++        orig = getattr(_c10d, name)
++        def wrapped(output, input_, *args, **kwargs):
++            if _stage_guard(input_) or _stage_guard(output):
++                cpu_in = input_.detach().to("cpu", copy=True)
++                cpu_out = torch.empty(
++                    output.shape, dtype=output.dtype, pin_memory=True)
++                kwargs["group"] = _resolve_cpu_group(kwargs.pop("group", None))
++                orig(cpu_out, cpu_in, *args, **kwargs)
++                output.copy_(cpu_out, non_blocking=False)
++                return None
++            return orig(output, input_, *args, **kwargs)
++        setattr(_c10d, name, wrapped)
++        setattr(dist, name, wrapped)
++
++    _wrap_unary("all_reduce")
++    _wrap_all_gather()
++    _wrap_all_gather_into_tensor()
++    _wrap_reduce_scatter_tensor()
++    logger.info("host-staged functional collectives installed")
+diff --git a/vllm/model_executor/layers/vocab_parallel_embedding.py b/vllm/model_executor/layers/vocab_parallel_embedding.py
+index 79695084e..6361522bc 100644
+--- a/vllm/model_executor/layers/vocab_parallel_embedding.py
++++ b/vllm/model_executor/layers/vocab_parallel_embedding.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import os
+ from collections.abc import Sequence
+ from dataclasses import dataclass
+ 
+@@ -28,6 +29,9 @@ from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
+ from vllm.model_executor.parameter import BasevLLMParameter
+ from vllm.model_executor.utils import set_weight_attrs
+ from vllm.platforms import current_platform
++from vllm.logger import init_logger as _init_logger
++
++_logger = _init_logger(__name__)
+ 
+ DEFAULT_VOCAB_PADDING_SIZE = 64
+ 
+@@ -63,6 +67,264 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
+             from vllm.model_executor.layers.utils import dispatch_cpu_unquantized_gemm
+ 
+             dispatch_cpu_unquantized_gemm(layer, remove_weight=False)
++        self._maybe_prepare_xpu_int8_lm_head(layer)
++        self._maybe_prepare_xpu_int4_draft_lm_head(layer)
++
++    @staticmethod
++    def _env_enabled(name: str) -> bool:
++        return os.environ.get(name, "0").strip().lower() in (
++            "1",
++            "true",
++            "yes",
++            "on",
++        )
++
++    def _maybe_prepare_xpu_int8_lm_head(self, layer: torch.nn.Module) -> None:
++        if not self._env_enabled("VLLM_XPU_LM_HEAD_INT8"):
++            return
++        if layer.__class__.__name__ != "ParallelLMHead":
++            return
++        scope = os.environ.get("VLLM_XPU_LM_HEAD_INT8_SCOPE", "all").strip().lower()
++        prefix = str(getattr(layer, "_vllm_prefix", ""))
++        prefix_parts = {part for part in prefix.replace("/", ".").split(".") if part}
++        # Qwen3Next target head is loaded as "language_model.lm_head"; the
++        # bundled MTP drafter remaps shared weights into a bare "lm_head".
++        # Other MTP models include an explicit "mtp" prefix segment.
++        is_mtp_head = ("mtp" in prefix_parts or prefix == "lm_head"
++                            or getattr(layer, "_hx_is_draft_head", False))
++        if is_mtp_head and self._env_enabled("VLLM_XPU_DRAFT_LM_HEAD_INT4"):
++            return
++        if scope in ("target", "target-only", "target_only") and is_mtp_head:
++            return
++        if scope in ("draft", "draft-only", "draft_only", "mtp") and not is_mtp_head:
++            return
++        if scope not in (
++            "all",
++            "target",
++            "target-only",
++            "target_only",
++            "draft",
++            "draft-only",
++            "draft_only",
++            "mtp",
++        ):
++            _logger.warning(
++                "Unknown VLLM_XPU_LM_HEAD_INT8_SCOPE=%r; using all lm_head layers.",
++                scope,
++            )
++        weight = getattr(layer, "weight", None)
++        if weight is None or weight.device.type != "xpu":
++            return
++        if weight.dtype not in (torch.float16, torch.bfloat16):
++            _logger.warning(
++                "VLLM_XPU_LM_HEAD_INT8 requested but lm_head weight dtype is %s; "
++                "falling back to the default BF16/FP16 path.",
++                weight.dtype,
++            )
++            return
++        try:
++            import vllm_xpu_kernels._xpu_C  # noqa: F401
++        except Exception as exc:
++            _logger.warning(
++                "VLLM_XPU_LM_HEAD_INT8 requested but vllm_xpu_kernels._xpu_C "
++                "could not be imported (%r); falling back to default lm_head.",
++                exc,
++            )
++            return
++        required_ops = ("int8_gemm_w8a8", "per_token_quant_int8_xpu")
++        if any(not hasattr(torch.ops._xpu_C, op) for op in required_ops):
++            _logger.warning(
++                "VLLM_XPU_LM_HEAD_INT8 requested but required _xpu_C ops are "
++                "unavailable; falling back to default lm_head.")
++            return
++
++        # Dense Qwen3.6 lm_head is BF16 even in the AutoRound INT4 checkpoint.
++        # This experimental path keeps the original weight intact and adds a
++        # transient per-output-channel INT8 copy. It is default-off and must pass
++        # the quality gate before being treated as a candidate result.
++        with torch.no_grad():
++            # haxor: chunk the row loop — the fork's single float() shot is a
++            # 5 GB transient per head, which OOMs a single-card (TP1) load
++            # where the head is unsharded (2.54 GB full vocab per card).
++            num_rows, hidden = weight.shape
++            chunk = int(
++                os.environ.get("VLLM_XPU_LM_HEAD_INT8_CHUNK_ROWS", "4096")
++                or "4096")
++            scales = torch.empty(num_rows, dtype=torch.float32,
++                                 device=weight.device)
++            weight_q_t = torch.empty((hidden, num_rows), dtype=torch.int8,
++                                     device=weight.device)
++            for r0 in range(0, num_rows, chunk):
++                r1 = min(r0 + chunk, num_rows)
++                weight_f = weight[r0:r1].detach().float()
++                row_scales = (
++                    weight_f.abs().amax(dim=1).clamp_min(1.0e-10) / 127.0)
++                scales[r0:r1] = row_scales
++                weight_q_t[:, r0:r1] = (
++                    torch.round(weight_f / row_scales.view(-1, 1))
++                    .clamp(-127, 127)
++                    .to(torch.int8)
++                    .t()
++                )
++                del weight_f
++            weight_q_t = weight_q_t.contiguous()
++            scale_dtype = os.environ.get(
++                "VLLM_XPU_LM_HEAD_INT8_SCALE_DTYPE", "fp32"
++            ).strip().lower()
++            if scale_dtype in ("bf16", "bfloat16"):
++                scales = scales.to(torch.bfloat16)
++            elif scale_dtype in ("fp16", "float16", "half"):
++                scales = scales.to(torch.float16)
++            elif scale_dtype not in ("", "fp32", "float32"):
++                _logger.warning(
++                    "Unknown VLLM_XPU_LM_HEAD_INT8_SCALE_DTYPE=%r; using fp32.",
++                    scale_dtype,
++                )
++            scales = scales.contiguous()  # chunk-quantized above
++
++        for name, tensor in (("_xpu_lm_head_int8_weight_t", weight_q_t),
++                             ("_xpu_lm_head_int8_scale", scales)):
++            if name in layer._buffers:
++                layer._buffers[name] = tensor
++            else:
++                layer.register_buffer(name, tensor, persistent=False)
++        _logger.info(
++            "Prepared experimental XPU INT8 lm_head: prefix=%s scope=%s "
++            "weight_t=%s scale=%s scale_dtype=%s",
++            prefix or "<unknown>",
++            scope or "all",
++            tuple(weight_q_t.shape),
++            tuple(scales.shape),
++            scales.dtype,
++        )
++
++    def _maybe_prepare_xpu_int4_draft_lm_head(self, layer: torch.nn.Module) -> None:
++        if not self._env_enabled("VLLM_XPU_DRAFT_LM_HEAD_INT4"):
++            return
++        if layer.__class__.__name__ != "ParallelLMHead":
++            return
++        prefix = str(getattr(layer, "_vllm_prefix", ""))
++        prefix_parts = {part for part in prefix.replace("/", ".").split(".") if part}
++        # Qwen3Next MTP draft heads are either a bare "lm_head" after sharing or
++        # contain an "mtp" prefix segment. Keep the target lm_head exact.
++        is_mtp_head = (getattr(layer, "_hx_is_draft_head", False)
++                            or "mtp" in prefix_parts or prefix == "lm_head")
++        if not is_mtp_head:
++            return
++        weight = getattr(layer, "weight", None)
++        if weight is None or weight.device.type != "xpu":
++            return
++        if weight.dtype not in (torch.float16, torch.bfloat16):
++            _logger.warning(
++                "VLLM_XPU_DRAFT_LM_HEAD_INT4 requested but lm_head weight dtype "
++                "is %s; falling back to the default draft lm_head.",
++                weight.dtype,
++            )
++            return
++        try:
++            import vllm_xpu_kernels._xpu_C  # noqa: F401
++        except Exception as exc:
++            _logger.warning(
++                "VLLM_XPU_DRAFT_LM_HEAD_INT4 requested but "
++                "vllm_xpu_kernels._xpu_C could not be imported (%r); falling "
++                "back to default draft lm_head.",
++                exc,
++            )
++            return
++        if not hasattr(torch.ops._xpu_C, "int4_gemm_w4a16"):
++            _logger.warning(
++                "VLLM_XPU_DRAFT_LM_HEAD_INT4 requested but "
++                "_xpu_C.int4_gemm_w4a16 is unavailable; falling back.")
++            return
++
++        group_size = int(
++            os.environ.get("VLLM_XPU_DRAFT_LM_HEAD_INT4_GROUP_SIZE", "128")
++            or "128")
++        chunk_rows = int(
++            os.environ.get("VLLM_XPU_DRAFT_LM_HEAD_INT4_CHUNK_ROWS", "2048")
++            or "2048")
++        if group_size <= 0 or weight.shape[1] % group_size != 0:
++            raise ValueError(
++                "VLLM_XPU_DRAFT_LM_HEAD_INT4_GROUP_SIZE must divide hidden "
++                f"size {weight.shape[1]}, got {group_size}")
++        if group_size % 8 != 0:
++            raise ValueError(
++                "VLLM_XPU_DRAFT_LM_HEAD_INT4_GROUP_SIZE must be divisible by 8")
++
++        num_tokens, hidden = weight.shape
++        packed_k = hidden // 8
++        num_groups = hidden // group_size
++        chunk_rows = max(1, min(chunk_rows, num_tokens))
++        scale_dtype = os.environ.get(
++            "VLLM_XPU_DRAFT_LM_HEAD_INT4_SCALE_DTYPE", "bf16"
++        ).strip().lower()
++        if scale_dtype in ("fp16", "float16", "half"):
++            scale_torch_dtype = torch.float16
++        elif scale_dtype in ("fp32", "float32"):
++            scale_torch_dtype = torch.float32
++        else:
++            scale_torch_dtype = torch.bfloat16
++
++        with torch.no_grad():
++            # Store as [N, K/8] contiguous and pass the transposed view, matching
++            # oneDNN's int4 NT layout requirement (logical [K/8, N] with
++            # stride(0)==1). Values are unsigned nibbles with symmetric zp=8.
++            packed_storage = torch.empty(
++                (num_tokens, packed_k),
++                dtype=torch.int32,
++                device=weight.device,
++            )
++            scales = torch.empty(
++                (num_groups, num_tokens),
++                dtype=scale_torch_dtype,
++                device=weight.device,
++            )
++            factors = (
++                (16 ** torch.arange(8, device=weight.device, dtype=torch.int32))
++                .view(1, 1, 8)
++            )
++            for start in range(0, num_tokens, chunk_rows):
++                end = min(start + chunk_rows, num_tokens)
++                w = weight[start:end].detach().float()
++                w_grouped = w.view(end - start, num_groups, group_size)
++                chunk_scales = (
++                    w_grouped.abs().amax(dim=2).clamp_min(1.0e-10) / 7.0
++                )
++                scales[:, start:end] = chunk_scales.t().to(scale_torch_dtype)
++                q = torch.round(
++                    w_grouped / chunk_scales.unsqueeze(-1)
++                ).clamp(-8, 7).to(torch.int32) + 8
++                packed = (
++                    (q.view(end - start, packed_k, 8) * factors)
++                    .sum(dim=2)
++                    .to(torch.int32)
++                )
++                packed_storage[start:end].copy_(packed)
++                del w, w_grouped, chunk_scales, q, packed
++
++            qweight = packed_storage.t()
++            qzeros = torch.tensor([8], dtype=torch.int8, device=weight.device)
++
++        for name, tensor in (
++            ("_xpu_lm_head_int4_weight_t", qweight),
++            ("_xpu_lm_head_int4_scale", scales.contiguous()),
++            ("_xpu_lm_head_int4_qzeros", qzeros),
++        ):
++            if name in layer._buffers:
++                layer._buffers[name] = tensor
++            else:
++                layer.register_buffer(name, tensor, persistent=False)
++        layer._xpu_lm_head_int4_group_size = group_size
++        _logger.info(
++            "Prepared experimental XPU INT4 draft lm_head: prefix=%s "
++            "weight_t=%s stride=%s scale=%s scale_dtype=%s group_size=%d",
++            prefix or "<unknown>",
++            tuple(qweight.shape),
++            tuple(qweight.stride()),
++            tuple(scales.shape),
++            scales.dtype,
++            group_size,
++        )
+ 
+     def apply(
+         self,
+@@ -72,6 +334,72 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
+     ) -> torch.Tensor:
+         if envs.VLLM_BATCH_INVARIANT and current_platform.is_cuda_alike():
+             return linear_batch_invariant(x, layer.weight, bias)
++        if (
++            os.environ.get("VLLM_XPU_DRAFT_LM_HEAD_INT4", "0").strip().lower()
++            in ("1", "true", "yes", "on")
++            and bias is None
++            and x.device.type == "xpu"
++            and hasattr(layer, "_xpu_lm_head_int4_weight_t")
++            and hasattr(layer, "_xpu_lm_head_int4_scale")
++            and hasattr(layer, "_xpu_lm_head_int4_qzeros")
++        ):
++            # haxor port (from record fork): draft lm_head as RTN INT4 g128
++            # through oneDNN int4_gemm_w4a16. Draft logits only steer token
++            # proposals; the FP16/INT8 target head still verifies.
++            x_contiguous = x if x.is_contiguous() else x.contiguous()
++            out_shape = x_contiguous.shape[:-1] + (
++                layer._xpu_lm_head_int4_weight_t.shape[1],
++            )
++            logits = torch.ops._xpu_C.int4_gemm_w4a16(
++                x_contiguous.reshape(-1, x_contiguous.shape[-1]),
++                layer._xpu_lm_head_int4_weight_t,
++                None,
++                layer._xpu_lm_head_int4_scale,
++                layer._xpu_lm_head_int4_qzeros,
++                layer._xpu_lm_head_int4_group_size,
++                None,
++            )
++            fallback_margin_s = os.environ.get(
++                "VLLM_XPU_DRAFT_LM_HEAD_INT4_FALLBACK_MARGIN", "0")
++            try:
++                fallback_margin = float(fallback_margin_s or "0")
++            except ValueError:
++                fallback_margin = 0.0
++            if fallback_margin > 0.0 and logits.shape[-1] >= 2:
++                top2 = torch.topk(logits.float(), k=2, dim=-1).values
++                low_margin = (top2[:, 0] - top2[:, 1]) < fallback_margin
++                if bool(low_margin.any().item()):
++                    flat_x = x_contiguous.reshape(
++                        -1, x_contiguous.shape[-1])
++                    exact_logits = F.linear(
++                        flat_x[low_margin].to(layer.weight.dtype),
++                        layer.weight,
++                        bias,
++                    )
++                    logits[low_margin] = exact_logits.to(logits.dtype)
++            return logits.reshape(out_shape)
++        if (
++            os.environ.get("VLLM_XPU_LM_HEAD_INT8", "0").strip().lower()
++            in ("1", "true", "yes", "on")
++            and bias is None
++            and x.device.type == "xpu"
++            and hasattr(layer, "_xpu_lm_head_int8_weight_t")
++            and hasattr(layer, "_xpu_lm_head_int8_scale")
++        ):
++            # haxor port (from steve fork): W8A8 INT8 lm_head. The 2.54 GB
++            # FP16 vocab GEMM is read on every draft step and every verify;
++            # INT8 halves the single biggest per-step weight read.
++            x_contiguous = x if x.is_contiguous() else x.contiguous()
++            x_q, x_scale = torch.ops._xpu_C.per_token_quant_int8_xpu(
++                x_contiguous)
++            return torch.ops._xpu_C.int8_gemm_w8a8(
++                x_q,
++                x_scale,
++                layer._xpu_lm_head_int8_weight_t,
++                layer._xpu_lm_head_int8_scale,
++                layer.weight.dtype,
++                None,
++            )
+         return dispatch_unquantized_gemm()(layer, x, layer.weight, bias)
+ 
+     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
+diff --git a/vllm/model_executor/models/qwen3_5_mtp.py b/vllm/model_executor/models/qwen3_5_mtp.py
+index 67f06f4f5..24a97817c 100644
+--- a/vllm/model_executor/models/qwen3_5_mtp.py
++++ b/vllm/model_executor/models/qwen3_5_mtp.py
+@@ -4,6 +4,7 @@
+ 
+ from collections.abc import Iterable
+ 
++import os
+ import torch
+ from torch import nn
+ 
+@@ -109,10 +110,14 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
+         original_quant = vllm_config.quant_config
+         if quant_config and quant_config.get_name() not in ("modelopt_fp4",):
+             hf_qc = getattr(model_config.hf_config, "quantization_config", None)
+-            if isinstance(hf_qc, dict):
++            if os.environ.get("B70_MTP_BF16_DRAFT") == "1":
++                print("[B70] MTP draft: forcing unquantized build (env B70_MTP_BF16_DRAFT=1)")
++                vllm_config.quant_config = None
++            elif isinstance(hf_qc, dict):
+                 dynamic = hf_qc.get("dynamic", {})
+                 if any(k.startswith("-:") and "mtp" in k for k in dynamic):
+                     vllm_config.quant_config = None
++        # B70_MTP_NIGHTLY_DRAFT
+         self.layers = torch.nn.ModuleList(
+             Qwen3_5DecoderLayer(
+                 vllm_config,
+@@ -243,6 +248,10 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal):
+                 quant_config=self.quant_config,
+                 prefix=maybe_prefix(prefix, "lm_head"),
+             )
++            # haxor: mark the draft head so the INT4 draft-lm_head hook can
++            # distinguish it from the target head (_vllm_prefix is not
++            # populated at process_weights_after_loading time in this build).
++            self.lm_head._hx_is_draft_head = True
+             if config.tie_word_embeddings:
+                 self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
+         else:
+diff --git a/vllm/v1/attention/backends/gdn_attn.py b/vllm/v1/attention/backends/gdn_attn.py
+index 1a07a6957..43e46613c 100644
+--- a/vllm/v1/attention/backends/gdn_attn.py
++++ b/vllm/v1/attention/backends/gdn_attn.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Backend for GatedDeltaNet attention."""
+ 
++import os
+ from dataclasses import dataclass
+ from typing import Literal
+ 
+@@ -292,29 +293,47 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+                 num_decode_tokens = 0
+ 
+             if num_prefills == 0 and num_decodes == 0:
+-                spec_token_size = min(
+-                    num_spec_decodes * (self.num_spec + 1),
+-                    query_start_loc_cpu[-1].item(),
+-                )
+-                spec_token_indx = torch.arange(
+-                    spec_token_size,
+-                    dtype=torch.int32,
+-                    device=query_start_loc.device,
+-                )
+-                non_spec_token_indx = torch.empty(
+-                    0, dtype=torch.int32, device=query_start_loc.device
+-                )
+-                # Filter by spec_sequence_masks to exclude padded sequences
+-                spec_state_indices_tensor = block_table_tensor[
+-                    spec_sequence_masks_cpu, : self.num_spec + 1
+-                ]
+-                non_spec_state_indices_tensor = None
+-                # Padded sequences are always at the back, so the first
+-                # num_spec_decodes + 1 entries of query_start_loc already
+-                # contain the correct cumulative token counts.
+-                spec_query_start_loc = query_start_loc[: num_spec_decodes + 1]
+-                non_spec_query_start_loc = None
+-                non_spec_query_start_loc_cpu = None
++                expected_spec_token_size = num_spec_decodes * (self.num_spec + 1)
++                actual_spec_token_size = query_start_loc_cpu[-1].item()
++                if actual_spec_token_size < expected_spec_token_size:
++                    # B70_MTP_PARTIAL_FINAL_GROUP: The max-sequence boundary can
++                    # truncate the final speculative group. The XPU GDN kernel
++                    # requires complete groups, so process this final partial
++                    # group through the existing stateful non-spec prefill path.
++                    spec_sequence_masks = None
++                    spec_sequence_masks_cpu = None
++                    num_prefills = num_spec_decodes
++                    num_prefill_tokens = actual_spec_token_size
++                    num_spec_decodes = 0
++                    num_spec_decode_tokens = 0
++                    spec_token_indx = None
++                    non_spec_token_indx = None
++                    spec_state_indices_tensor = None
++                    non_spec_state_indices_tensor = block_table_tensor[:, 0]
++                    spec_query_start_loc = None
++                    non_spec_query_start_loc = query_start_loc
++                    non_spec_query_start_loc_cpu = query_start_loc_cpu
++                    num_accepted_tokens = None
++                else:
++                    spec_token_indx = torch.arange(
++                        expected_spec_token_size,
++                        dtype=torch.int32,
++                        device=query_start_loc.device,
++                    )
++                    non_spec_token_indx = torch.empty(
++                        0, dtype=torch.int32, device=query_start_loc.device
++                    )
++                    # Filter by spec_sequence_masks to exclude padded sequences
++                    spec_state_indices_tensor = block_table_tensor[
++                        spec_sequence_masks_cpu, : self.num_spec + 1
++                    ]
++                    non_spec_state_indices_tensor = None
++                    # Padded sequences are always at the back, so the first
++                    # num_spec_decodes + 1 entries of query_start_loc already
++                    # contain the correct cumulative token counts.
++                    spec_query_start_loc = query_start_loc[: num_spec_decodes + 1]
++                    non_spec_query_start_loc = None
++                    non_spec_query_start_loc_cpu = None
+             else:
+                 spec_token_masks = torch.repeat_interleave(
+                     spec_sequence_masks,
+@@ -363,8 +382,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+                     out=non_spec_query_start_loc_cpu[1:],
+                 )
+ 
+-            assert num_accepted_tokens is not None
+-            num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]
++            if spec_sequence_masks_cpu is not None:
++                assert num_accepted_tokens is not None
++                num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]
+ 
+         chunk_indices: torch.Tensor | None = None
+         chunk_offsets: torch.Tensor | None = None
+@@ -436,6 +456,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+             and num_spec_decode_tokens <= self.decode_cudagraph_max_bs
+         ):
+             assert spec_sequence_masks is not None
++            if os.environ.get("GDN_DEBUG_REFRESH", "0") == "1":
++                print("GDN_DEBUG_REFRESH fired spec=%d" % num_spec_decodes, flush=True)
+             self.spec_state_indices_tensor[:num_spec_decodes].copy_(
+                 spec_state_indices_tensor, non_blocking=True
+             )
+@@ -495,6 +517,30 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+             non_spec_query_start_loc = self.non_spec_query_start_loc[: batch_size + 1]
+             non_spec_query_start_loc[num_decodes + 1 :].fill_(non_spec_num_query_tokens)
+ 
++        import os as _os
++        if _os.environ.get("GDN_DEBUG_META"):
++            import torch as _t
++            _n = getattr(self, "_dbg_n", 0)
++            self._dbg_n = _n + 1
++            if _n < 12:
++                _si = spec_state_indices_tensor
++                _nsi = non_spec_state_indices_tensor
++                print(
++                    "GDN_DEBUG_META call=%d pre=%d dec=%d spec=%d spectok=%d "
++                    "full_cg=%s spec_idx=%s nonspec_idx=%s has_init=%s"
++                    % (
++                        _n, num_prefills, num_decodes, num_spec_decodes,
++                        num_spec_decode_tokens, self.use_full_cuda_graph,
++                        (_si.flatten()[:8].tolist()
++                         if isinstance(_si, _t.Tensor) else None),
++                        (_nsi.flatten()[:8].tolist()
++                         if isinstance(_nsi, _t.Tensor) else None),
++                        (has_initial_state.flatten()[:4].tolist()
++                         if isinstance(has_initial_state, _t.Tensor) else None),
++                    ),
++                    flush=True,
++                )
++
+         attn_metadata = GDNAttentionMetadata(
+             num_prefills=num_prefills,
+             num_prefill_tokens=num_prefill_tokens,
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index e81913f92..d7d334326 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -4,6 +4,7 @@
+ import functools
+ import gc
+ import itertools
++import os
+ import threading
+ import time
+ from collections import defaultdict
+@@ -1630,6 +1631,18 @@ class GPUModelRunner(
+         num_reqs = output_token_ids.size(0)
+         self.num_accepted_tokens.gpu[:num_reqs] = (output_token_ids != -1).sum(dim=1)
+ 
++        if os.environ.get("VLLM_XPU_VERIFY_TRACE", "0") == "1":
++            _acc = (output_token_ids != -1).sum(dim=1).cpu().tolist()
++            _row = output_token_ids.cpu().tolist()
++            _drafts = {}
++            for _rid, _tok in scheduler_output.scheduled_spec_decode_tokens.items():
++                _drafts[str(_rid)] = [int(x) for x in _tok]
++            print(
++                "[verify-trace] num_reqs=%d accepted=%s row=%s drafts=%s"
++                % (num_reqs, _acc, _row, _drafts),
++                flush=True,
++            )
++
+         if self.cache_config.mamba_cache_mode == "align":
+             # Fused GPU postprocess: state copies + per-request accepted-token
+             # update without CPU-GPU sync. The metadata
+@@ -3614,6 +3627,7 @@ class GPUModelRunner(
+         dict[str, Any],
+         ECConnectorOutput | None,
+     ]:
++        self._xpu_t_fwd_start = time.perf_counter()
+         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+         is_first_rank = get_pp_group().is_first_rank
+         is_encoder_decoder = self.model_config.is_encoder_decoder
+@@ -4559,6 +4573,7 @@ class GPUModelRunner(
+                 **model_kwargs,
+             )
+ 
++        self._xpu_t_fwd = time.perf_counter()
+         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
+             if self.use_aux_hidden_state_outputs:
+                 # True when EAGLE 3 is used.
+@@ -4705,6 +4720,7 @@ class GPUModelRunner(
+                     sampler_output.sampled_token_ids
+                 )
+ 
++        self._xpu_t_sample = time.perf_counter()
+         self._draft_token_ids = None
+         self._draft_probs = None
+         self._draft_prob_req_ids = None
+@@ -4835,6 +4851,22 @@ class GPUModelRunner(
+                 scheduler_output.total_num_scheduled_tokens,
+             )
+ 
++        if os.environ.get("VLLM_XPU_STEP_TIMING", "0") == "1":
++            _tb = time.perf_counter()
++            print(
++                "[xpu-step-timing] fwd=%.3fms samp=%.3fms book=%.3fms total=%.3fms"
++                " num_sched=%d spec_tokens=%d"
++                % (
++                    (self._xpu_t_fwd - self._xpu_t_fwd_start) * 1000,
++                    (self._xpu_t_sample - self._xpu_t_fwd) * 1000,
++                    (_tb - self._xpu_t_sample) * 1000,
++                    (_tb - self._xpu_t_fwd_start) * 1000,
++                    scheduler_output.total_num_scheduled_tokens,
++                    sum(len(v) for v in scheduler_output.scheduled_spec_decode_tokens.values()),
++                ),
++                flush=True,
++            )
++
+         if draft_after_bookkeeping:
+             # ngram and other speculative decoding methods use the sampled
+             # tokens on the CPU, so they are run after bookkeeping.
+diff --git a/vllm/v1/worker/mamba_utils.py b/vllm/v1/worker/mamba_utils.py
+index f87a34a36..fc7a1d566 100644
+--- a/vllm/v1/worker/mamba_utils.py
++++ b/vllm/v1/worker/mamba_utils.py
+@@ -25,6 +25,14 @@ from vllm.v1.worker.lora_model_runner_mixin import GPUInputBatch
+ 
+ logger = init_logger(__name__)
+ 
++def _to_s64(addr: int) -> int:
++    """Reinterpret a 64-bit device address as signed int64 for torch int64
++    buffers. XPU VMM addresses can exceed 2**63-1; the triton consumers load
++    the raw 64-bit pattern, so two's-complement storage is bit-exact."""
++    return addr if addr < (1 << 63) else addr - (1 << 64)
++
++
++
+ # 16 saturates HBM on H100/GB200 across the reqs=8..128 range in
+ # microbenchmarks
+ _TEMPORAL_TILES = 16
+@@ -764,7 +772,7 @@ class MambaSpecDecodeGPUContext:
+ 
+                 for state_type_idx, state in enumerate(kv_caches):
+                     # Base address
+-                    self.state_base_addrs[idx] = state.data_ptr()
++                    self.state_base_addrs[idx] = _to_s64(state.data_ptr())
+ 
+                     # Block stride (bytes between consecutive blocks)
+                     # state shape: [num_blocks, ...], stride(0) = elements per block
+@@ -852,7 +860,7 @@ class MambaSpecDecodeGPUContext:
+         )
+         self.block_table_stride_req = int(next(iter(strides)))
+         for i, bt in enumerate(block_tables):
+-            self.block_table_ptrs[i] = bt.data_ptr()
++            self.block_table_ptrs[i] = _to_s64(bt.data_ptr())
+ 
+         self.is_initialized = True
+ 

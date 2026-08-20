@@ -1,0 +1,2 @@
+8e6d8e4f6a0c84db0d79129ab648492edf640fe2
+[XPU][CI/Release][3/N] Add xpu wheel release to release pipeline (#52108)

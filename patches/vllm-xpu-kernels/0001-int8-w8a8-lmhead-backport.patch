@@ -1,0 +1,859 @@
+diff -ruN '--exclude=.git' '--exclude=build' '--exclude=.deps' /home/haxor/src/vllm-xpu-kernels/CMakeLists.txt /home/haxor/kernels-int8-build/CMakeLists.txt
+--- /home/haxor/src/vllm-xpu-kernels/CMakeLists.txt	2026-08-14 02:10:01.719633256 -0500
++++ /home/haxor/kernels-int8-build/CMakeLists.txt	2026-08-19 18:26:30.626832620 -0500
+@@ -630,7 +630,8 @@
+       "csrc/xpu/sycl/multimodal_rope.cpp"
+       "csrc/xpu/sycl/apply_rotary_emb.cpp"
+       "csrc/xpu/rand/exponential.cpp"
+-      "csrc/xpu/utils.cpp")
++      "csrc/xpu/utils.cpp"
++      "csrc/xpu/quantization/int8_quant.cpp")
+   if(MOE_KERNELS_ENABLED)
+     list(APPEND VLLM_EXT_XPU_SRC
+          "csrc/xpu/grouped_gemm/grouped_gemm_interface.cpp")
+diff -ruN '--exclude=.git' '--exclude=build' '--exclude=.deps' /home/haxor/src/vllm-xpu-kernels/csrc/xpu/onednn/int8_gemm_w8a8.h /home/haxor/kernels-int8-build/csrc/xpu/onednn/int8_gemm_w8a8.h
+--- /home/haxor/src/vllm-xpu-kernels/csrc/xpu/onednn/int8_gemm_w8a8.h	1969-12-31 18:00:00.000000000 -0600
++++ /home/haxor/kernels-int8-build/csrc/xpu/onednn/int8_gemm_w8a8.h	2026-08-19 18:26:30.626497654 -0500
+@@ -0,0 +1,214 @@
++#pragma once
++
++#include <array>
++#include <cstdlib>
++
++#include <c10/xpu/XPUStream.h>
++#include <dnnl.hpp>
++#include <torch/torch.h>
++
++#include "onednn_ext.h"
++#include "onednn_runtime.h"
++
++namespace oneDNN {
++
++struct int8_gemm_scratchpad_ring_t {
++  std::vector<torch::Tensor> tensors;
++  int next = 0;
++};
++
++static inline int get_int8_gemm_scratchpad_ring_size() {
++  static const int ring_size = []() {
++    const char* env = std::getenv("VLLM_XPU_INT8_GEMM_SCRATCHPAD_RING_SIZE");
++    if (env == nullptr || env[0] == '\0') {
++      return 1;
++    }
++    int parsed = std::atoi(env);
++    if (parsed < 1) {
++      parsed = 1;
++    }
++    if (parsed > 16) {
++      parsed = 16;
++    }
++    return parsed;
++  }();
++  return ring_size;
++}
++
++static inline torch::Tensor& get_int8_gemm_scratchpad_cache(
++    const int device_id,
++    const int scratchpad_size,
++    const torch::TensorOptions& options) {
++  static thread_local std::array<
++      ska::flat_hash_map<int, int8_gemm_scratchpad_ring_t>,
++      16>
++      scratchpads;
++
++  auto& device_scratchpads = scratchpads[device_id];
++  auto& entry = device_scratchpads[scratchpad_size];
++  const int ring_size = get_int8_gemm_scratchpad_ring_size();
++  if (static_cast<int>(entry.tensors.size()) != ring_size) {
++    entry.tensors.clear();
++    entry.tensors.reserve(ring_size);
++    for (int i = 0; i < ring_size; ++i) {
++      entry.tensors.push_back(
++          at::empty({scratchpad_size}, options.dtype(at::kByte), c10::nullopt));
++    }
++    entry.next = 0;
++  } else {
++    for (int i = 0; i < ring_size; ++i) {
++      if (!entry.tensors[i].defined()) {
++        entry.tensors[i] = at::empty(
++            {scratchpad_size}, options.dtype(at::kByte), c10::nullopt);
++      }
++    }
++  }
++
++  torch::Tensor& tensor = entry.tensors[entry.next % ring_size];
++  entry.next = (entry.next + 1) % ring_size;
++  return tensor;
++}
++
++static inline void dnnl_matmul_w8a8_int8(
++    torch::Tensor& result,       // dst, [m, n] or [b, m, n]
++    const torch::Tensor& mat1,   // quantized src, [m, k] or [b, m, k]
++    const torch::Tensor& m1_sc,  // src scales, [m, 1] or [1]
++    const torch::Tensor& mat2,   // quantized weight, [k, n] or [n, k]
++    const torch::Tensor& m2_sc,  // weight scales, [n] / [n, 1] or [1]
++    bool is_nt,
++    const std::optional<torch::Tensor>& bias) {
++  auto src_sz = mat1.sizes();
++  auto o_sz = result.sizes();
++
++  const int m = std::reduce(
++      src_sz.begin(), src_sz.end() - 1, 1, std::multiplies<int64_t>());
++  const int n = o_sz.back();
++  const int k = *(src_sz.end() - 1);
++
++  TORCH_CHECK(mat1.scalar_type() == at::ScalarType::Char,
++              "input must be int8 for int8 matmul");
++  TORCH_CHECK(mat2.scalar_type() == at::ScalarType::Char,
++              "weight must be int8 for int8 matmul");
++
++  joint_dtypes_t jd;
++  if (result.scalar_type() == torch::kBFloat16) {
++    jd = joint_dtypes_t::s8_s8_bf16;
++  } else if (result.scalar_type() == torch::kFloat16) {
++    jd = joint_dtypes_t::s8_s8_f16;
++  } else {
++    TORCH_CHECK(false, "output must be float16 or bfloat16 for int8 matmul");
++  }
++
++  bias_type_t b_type = get_bias_type(bias, m, n);
++  trans_type_t tt = is_nt ? trans_type_t::nt : trans_type_t::nn;
++
++  auto mat1_strides = mat1.strides();
++  int64_t leading_dim = -1;
++  if (mat1.dim() == 2) {
++    leading_dim = 0;
++  } else if (mat1.dim() == 3) {
++    leading_dim = mat1_strides[0] < mat1_strides[1] ? 0 : 1;
++  } else {
++    TORCH_CHECK(false, "Unsupported input dimension for int8 matmul: ", mat1.dim());
++  }
++
++  int64_t lda = mat1_strides[leading_dim];
++  int64_t ldb = mat2.strides()[mat2.dim() - 1] == 1
++                    ? mat2.strides()[mat2.dim() - 2]
++                    : mat2.strides()[mat2.dim() - 1];
++  int64_t ldc = result.strides()[leading_dim];
++
++  auto f_attr = [&](dnnl::primitive_attr& pattr) {
++    pattr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
++
++    if (m1_sc.numel() == 1) {
++      pattr.set_scales(
++          DNNL_ARG_SRC, /* mask */ 0, {}, get_onednn_dtype(m1_sc));
++    } else {
++      TORCH_CHECK(
++          m1_sc.numel() == m,
++          "input scales must be per-tensor or per-token for int8 matmul");
++      pattr.set_scales(
++          DNNL_ARG_SRC,
++          /* mask */ (1 << 0) + (1 << 1),
++          {1, k},
++          get_onednn_dtype(m1_sc));
++    }
++
++    if (m2_sc.numel() == 1) {
++      pattr.set_scales(
++          DNNL_ARG_WEIGHTS, /* mask */ 0, {}, get_onednn_dtype(m2_sc));
++    } else {
++      TORCH_CHECK(
++          m2_sc.numel() == n,
++          "weight scales must be per-tensor or per-output-channel for int8 matmul");
++      pattr.set_scales(
++          DNNL_ARG_WEIGHTS,
++          /* mask */ (1 << 1),
++          {},
++          get_onednn_dtype(m2_sc));
++    }
++  };
++
++  const int dev_id = c10::xpu::getCurrentXPUStream().device_index();
++  at::Device curDevice = at::Device(at::kXPU, dev_id);
++  auto engine = GpuEngineManager::Instance().get_engine(curDevice);
++
++  int sc_group_size = ((m1_sc.numel() == 1 ? 1 : 2) << 8) |
++                      (m2_sc.numel() == 1 ? 1 : 2);
++  auto& matmul_ext = matmul_primitive_create_and_cache(
++      jd, tt, b_type, m, n, k, lda, ldb, ldc, dev_id, f_attr, sc_group_size);
++
++  int arg_off = 0;
++  matmul_ext.set_attribute(
++      arg_off++, DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, m2_sc.data_ptr(), [&]() {
++        return make_onednn_memory(
++            get_onednn_md(m2_sc), engine, m2_sc.data_ptr());
++      });
++  matmul_ext.set_attribute(
++      arg_off++, DNNL_ARG_ATTR_SCALES | DNNL_ARG_SRC, m1_sc.data_ptr(), [&]() {
++        return make_onednn_memory(
++            get_onednn_md(m1_sc), engine, m1_sc.data_ptr());
++      });
++
++  std::vector<std::pair<int, void*>> arg_handles;
++  arg_handles.reserve(8);
++  arg_handles.emplace_back(DNNL_ARG_SRC, mat1.data_ptr());
++  arg_handles.emplace_back(DNNL_ARG_WEIGHTS, mat2.data_ptr());
++  arg_handles.emplace_back(DNNL_ARG_DST, result.data_ptr());
++  if (get_shape(b_type) != bias_shape_t::none) {
++    arg_handles.emplace_back(DNNL_ARG_BIAS, bias.value().data_ptr());
++  }
++
++  int scratchpad_size = matmul_ext.get_scratchpad_size();
++  torch::Tensor& scratchpad_tensor =
++      get_int8_gemm_scratchpad_cache(dev_id, scratchpad_size, mat1.options());
++  arg_handles.emplace_back(DNNL_ARG_SCRATCHPAD, scratchpad_tensor.data_ptr());
++
++  auto& strm = GpuStreamManager::Instance().get_stream();
++  std::vector<sycl::event> deps;
++  if (const char* dependency = std::getenv(
++          "VLLM_XPU_ONEDNN_INT8_INPUT_DEPENDENCY");
++      dependency != nullptr && dependency[0] == '1' &&
++      dependency[1] == '\0') {
++    // The per-token quantization kernels run on PyTorch's current queue.
++    // Pass that queue tail to oneDNN so the W8A8 LM head cannot consume the
++    // quantized activations or scales before their producers complete.
++    auto& queue = c10::xpu::getCurrentXPUStream().queue();
++    deps.emplace_back(queue.ext_oneapi_submit_barrier());
++    TORCH_WARN_ONCE("VLLM_XPU_ONEDNN_INT8_INPUT_DEPENDENCY reached");
++  }
++  auto done = matmul_ext.execute(
++      strm, engine, std::move(arg_handles), arg_off, std::move(deps));
++  if (const char* barrier = std::getenv(
++          "VLLM_XPU_ONEDNN_INT8_COMPLETION_BARRIER");
++      barrier != nullptr && barrier[0] == '1' && barrier[1] == '\0') {
++    // Publish the oneDNN completion event onto PyTorch's current stream before
++    // a TP all-gather consumes the local LM-head logits on oneCCL's stream.
++    // This is an asynchronous device dependency, not a host wait.
++    auto& queue = c10::xpu::getCurrentXPUStream().queue();
++    queue.ext_oneapi_submit_barrier({done});
++    TORCH_WARN_ONCE("VLLM_XPU_ONEDNN_INT8_COMPLETION_BARRIER reached");
++  }
++}
++}  // namespace oneDNN
+diff -ruN '--exclude=.git' '--exclude=build' '--exclude=.deps' /home/haxor/src/vllm-xpu-kernels/csrc/xpu/onednn/onednn_ext.h /home/haxor/kernels-int8-build/csrc/xpu/onednn/onednn_ext.h
+--- /home/haxor/src/vllm-xpu-kernels/csrc/xpu/onednn/onednn_ext.h	2026-08-14 02:10:01.725649797 -0500
++++ /home/haxor/kernels-int8-build/csrc/xpu/onednn/onednn_ext.h	2026-08-19 19:35:27.782036093 -0500
+@@ -47,6 +47,8 @@
+   bf16_f8_e5m2,
+   f16_f8_e4m3,
+   bf16_f8_e4m3,
++  s8_s8_f16,
++  s8_s8_bf16,
+   f8_e5m2_f16,
+   f8_e5m2_bf16,
+   f8_e4m3_f16,
+@@ -101,6 +103,26 @@
+ };
+ 
+ template <>
++struct onednn_types_mapper<joint_dtypes_t::s8_s8_f16> {
++  static inline std::
++      tuple<memory::data_type, memory::data_type, memory::data_type>
++      get() {
++    return std::make_tuple(
++        memory::data_type::s8, memory::data_type::s8, memory::data_type::f16);
++  }
++};
++
++template <>
++struct onednn_types_mapper<joint_dtypes_t::s8_s8_bf16> {
++  static inline std::
++      tuple<memory::data_type, memory::data_type, memory::data_type>
++      get() {
++    return std::make_tuple(
++        memory::data_type::s8, memory::data_type::s8, memory::data_type::bf16);
++  }
++};
++
++template <>
+ struct onednn_types_mapper<joint_dtypes_t::f16_f8_e5m2> {
+   static inline std::
+       tuple<memory::data_type, memory::data_type, memory::data_type>
+@@ -707,7 +729,8 @@
+       const stream& astream,
+       const engine& aengine,
+       std::vector<std::pair<int, void*>>&& handles,
+-      int slot_off = 2) {
++      int slot_off = 2,
++      std::vector<sycl::event> deps = {}) {
+     auto off = slot_off;
+     for (const auto& p : handles) {
+       auto& m_arg = mem_arg_cache[off];
+@@ -722,7 +745,6 @@
+     }
+ 
+     sycl::event return_event;
+-    std::vector<sycl::event> deps{};
+     error::wrap_c_api(
+         dnnl_sycl_interop_primitive_execute(
+             this->get(), astream.get(), off, c_args, &deps, &return_event),
+@@ -993,6 +1015,36 @@
+           Tt,
+           b_type,
+           m,
++          n,
++          k,
++          lda,
++          ldb,
++          ldc,
++          device_id,
++          attr,
++          scale_group_size,
++          zp_group_size,
++          batch_dim);
++    case joint_dtypes_t::s8_s8_f16:
++      return matmul_primitive_create_and_cache<joint_dtypes_t::s8_s8_f16, F>(
++          Tt,
++          b_type,
++          m,
++          n,
++          k,
++          lda,
++          ldb,
++          ldc,
++          device_id,
++          attr,
++          scale_group_size,
++          zp_group_size,
++          batch_dim);
++    case joint_dtypes_t::s8_s8_bf16:
++      return matmul_primitive_create_and_cache<joint_dtypes_t::s8_s8_bf16, F>(
++          Tt,
++          b_type,
++          m,
+           n,
+           k,
+           lda,
+diff -ruN '--exclude=.git' '--exclude=build' '--exclude=.deps' /home/haxor/src/vllm-xpu-kernels/csrc/xpu/onednn/onednn_matmul.cpp /home/haxor/kernels-int8-build/csrc/xpu/onednn/onednn_matmul.cpp
+--- /home/haxor/src/vllm-xpu-kernels/csrc/xpu/onednn/onednn_matmul.cpp	2026-08-14 02:10:01.725649797 -0500
++++ /home/haxor/kernels-int8-build/csrc/xpu/onednn/onednn_matmul.cpp	2026-08-19 18:26:30.626659044 -0500
+@@ -3,6 +3,7 @@
+ #include "fp8_gemm_w8a8.h"
+ #include "fp8_gemm_w8a16.h"
+ #include "int4_gemm_w4a16.h"
++#include "int8_gemm_w8a8.h"
+ #include "int4_gemm_w4a8.h"
+ 
+ inline bool is_supported_fp8(at::ScalarType t) {
+@@ -255,3 +256,48 @@
+ 
+   return result;
+ }
++
++// haxor backport: INT8 W8A8 GEMM wrappers
++torch::Tensor int8_gemm_w8a8(
++    const torch::Tensor& A,
++    const torch::Tensor& A_scale,
++    const torch::Tensor& B,
++    const torch::Tensor& B_scale,
++    std::optional<c10::ScalarType> out_dtype,
++    const std::optional<torch::Tensor>& bias_) {
++  const at::DeviceGuard device_guard(A.device());
++  torch::Tensor result = check_and_create_output_tensor(A, B, out_dtype);
++  bool is_nt = B.strides()[B.dim() - 2] == 1;
++  oneDNN::dnnl_matmul_w8a8_int8(result, A, A_scale, B, B_scale, is_nt, bias_);
++  return result;
++}
++
++
++torch::Tensor int8_gemm_w8a8_out(
++    const torch::Tensor& A,
++    const torch::Tensor& A_scale,
++    const torch::Tensor& B,
++    const torch::Tensor& B_scale,
++    torch::Tensor& output,
++    const std::optional<torch::Tensor>& bias_) {
++  const at::DeviceGuard device_guard(A.device());
++  torch::Tensor expected = check_and_create_output_tensor(
++      A, B, output.scalar_type());
++  TORCH_CHECK(output.is_xpu(), "int8_gemm_w8a8_out output must be XPU");
++  TORCH_CHECK(output.is_contiguous(), "int8_gemm_w8a8_out output must be contiguous");
++  TORCH_CHECK(
++      output.sizes() == expected.sizes(),
++      "int8_gemm_w8a8_out output shape mismatch: expected ",
++      expected.sizes(),
++      " got ",
++      output.sizes());
++  TORCH_CHECK(
++      output.scalar_type() == torch::kFloat16 ||
++          output.scalar_type() == torch::kBFloat16,
++      "int8_gemm_w8a8_out output must be float16 or bfloat16");
++  bool is_nt = B.strides()[B.dim() - 2] == 1;
++  oneDNN::dnnl_matmul_w8a8_int8(
++      output, A, A_scale, B, B_scale, is_nt, bias_);
++  return output;
++}
++
+diff -ruN '--exclude=.git' '--exclude=build' '--exclude=.deps' /home/haxor/src/vllm-xpu-kernels/csrc/xpu/ops.h /home/haxor/kernels-int8-build/csrc/xpu/ops.h
+--- /home/haxor/src/vllm-xpu-kernels/csrc/xpu/ops.h	2026-08-14 02:10:01.725649797 -0500
++++ /home/haxor/kernels-int8-build/csrc/xpu/ops.h	2026-08-19 18:26:30.626519116 -0500
+@@ -327,3 +327,29 @@
+     torch::Tensor& packed_out,
+     torch::Tensor& scales_out,
+     torch::Tensor& weights_out);
++
++// haxor backport (from lab fork 0fd18a7): W8A8 INT8 GEMM + per-token quantizer
++// for the INT8 lm_head path in vLLM (VLLM_XPU_LM_HEAD_INT8).
++torch::Tensor int8_gemm_w8a8(
++    const torch::Tensor& A,
++    const torch::Tensor& A_scale,
++    const torch::Tensor& B,
++    const torch::Tensor& B_scale,
++    std::optional<c10::ScalarType> out_dtype,
++    const std::optional<torch::Tensor>& bias);
++
++torch::Tensor int8_gemm_w8a8_out(
++    const torch::Tensor& A,
++    const torch::Tensor& A_scale,
++    const torch::Tensor& B,
++    const torch::Tensor& B_scale,
++    torch::Tensor& output,
++    const std::optional<torch::Tensor>& bias);
++
++std::tuple<torch::Tensor, torch::Tensor> per_token_quant_int8_xpu(
++    const torch::Tensor& x);
++
++std::tuple<torch::Tensor, torch::Tensor> per_token_quant_int8_xpu_out(
++    const torch::Tensor& x,
++    torch::Tensor& q,
++    torch::Tensor& scales);
+diff -ruN '--exclude=.git' '--exclude=build' '--exclude=.deps' /home/haxor/src/vllm-xpu-kernels/csrc/xpu/quantization/int8_quant.cpp /home/haxor/kernels-int8-build/csrc/xpu/quantization/int8_quant.cpp
+--- /home/haxor/src/vllm-xpu-kernels/csrc/xpu/quantization/int8_quant.cpp	1969-12-31 18:00:00.000000000 -0600
++++ /home/haxor/kernels-int8-build/csrc/xpu/quantization/int8_quant.cpp	2026-08-19 18:26:30.626519116 -0500
+@@ -0,0 +1,404 @@
++#include <sycl/sycl.hpp>
++#include <torch/all.h>
++
++#include "utils.h"
++
++namespace {
++
++template <typename scalar_t>
++float to_float(scalar_t value) {
++  return static_cast<float>(value);
++}
++
++template <typename scalar_t>
++float roundtrip_output_dtype(float value) {
++  return to_float(static_cast<scalar_t>(value));
++}
++
++template <typename scalar_t>
++float silu_mul_value(scalar_t gate, scalar_t up) {
++  const float gate_f = to_float(gate);
++  const scalar_t silu =
++      static_cast<scalar_t>(gate_f / (1.0f + sycl::exp(-gate_f)));
++  return to_float(static_cast<scalar_t>(silu * up));
++}
++
++template <typename scalar_t>
++void launch_per_token_quant_int8(
++    const scalar_t* x,
++    int8_t* q,
++    float* scales,
++    int64_t rows,
++    int64_t cols) {
++  constexpr int kBlockSize = 256;
++  auto& queue = vllm::xpu::vllmGetQueue();
++  sycl::range<1> local(kBlockSize);
++  sycl::range<1> global(rows * kBlockSize);
++
++  queue.submit([&](sycl::handler& cgh) {
++    sycl::local_accessor<float, 1> local_max(local, cgh);
++    cgh.parallel_for(
++        sycl::nd_range<1>(global, local),
++        [=](sycl::nd_item<1> item)
++            [[sycl::reqd_sub_group_size(16)]] {
++              const int64_t row = item.get_group(0);
++              const int local_id = item.get_local_id(0);
++              const int local_range = item.get_local_range(0);
++
++              float thread_max = 0.0f;
++              const int64_t row_offset = row * cols;
++              for (int64_t col = local_id; col < cols; col += local_range) {
++                const float value = to_float(x[row_offset + col]);
++                thread_max = sycl::fmax(thread_max, sycl::fabs(value));
++              }
++
++              local_max[local_id] = thread_max;
++              item.barrier(sycl::access::fence_space::local_space);
++
++              for (int stride = local_range / 2; stride > 0; stride >>= 1) {
++                if (local_id < stride) {
++                  local_max[local_id] =
++                      sycl::fmax(local_max[local_id],
++                                 local_max[local_id + stride]);
++                }
++                item.barrier(sycl::access::fence_space::local_space);
++              }
++
++              const float absmax = sycl::fmax(local_max[0], 1.0e-10f);
++              const float scale = absmax / 127.0f;
++              if (local_id == 0) {
++                scales[row] = scale;
++              }
++
++              const float inv_scale = 127.0f / absmax;
++              for (int64_t col = local_id; col < cols; col += local_range) {
++                float value = to_float(x[row_offset + col]) * inv_scale;
++                value = sycl::round(value);
++                value = sycl::fmin(127.0f, sycl::fmax(-127.0f, value));
++                q[row_offset + col] = static_cast<int8_t>(value);
++              }
++            });
++  });
++}
++
++template <typename scalar_t>
++void launch_silu_and_mul_quant_int8(
++    const scalar_t* x,
++    int8_t* q,
++    float* scales,
++    int64_t rows,
++    int64_t cols) {
++  constexpr int kBlockSize = 256;
++  auto& queue = vllm::xpu::vllmGetQueue();
++  sycl::range<1> local(kBlockSize);
++  sycl::range<1> global(rows * kBlockSize);
++
++  queue.submit([&](sycl::handler& cgh) {
++    sycl::local_accessor<float, 1> local_max(local, cgh);
++    cgh.parallel_for(
++        sycl::nd_range<1>(global, local),
++        [=](sycl::nd_item<1> item)
++            [[sycl::reqd_sub_group_size(16)]] {
++              const int64_t row = item.get_group(0);
++              const int local_id = item.get_local_id(0);
++              const int local_range = item.get_local_range(0);
++              const int64_t input_row_offset = row * cols * 2;
++              const int64_t output_row_offset = row * cols;
++
++              float thread_max = 0.0f;
++              for (int64_t col = local_id; col < cols; col += local_range) {
++                const scalar_t gate = x[input_row_offset + col];
++                const scalar_t up = x[input_row_offset + cols + col];
++                const float value = silu_mul_value(gate, up);
++                thread_max = sycl::fmax(thread_max, sycl::fabs(value));
++              }
++
++              local_max[local_id] = thread_max;
++              item.barrier(sycl::access::fence_space::local_space);
++
++              for (int stride = local_range / 2; stride > 0; stride >>= 1) {
++                if (local_id < stride) {
++                  local_max[local_id] =
++                      sycl::fmax(local_max[local_id],
++                                 local_max[local_id + stride]);
++                }
++                item.barrier(sycl::access::fence_space::local_space);
++              }
++
++              const float absmax = sycl::fmax(local_max[0], 1.0e-10f);
++              const float scale = absmax / 127.0f;
++              if (local_id == 0) {
++                scales[row] = scale;
++              }
++
++              const float inv_scale = 127.0f / absmax;
++              for (int64_t col = local_id; col < cols; col += local_range) {
++                const scalar_t gate = x[input_row_offset + col];
++                const scalar_t up = x[input_row_offset + cols + col];
++                float value = silu_mul_value(gate, up);
++                value = sycl::round(value * inv_scale);
++                value = sycl::fmin(127.0f, sycl::fmax(-127.0f, value));
++                q[output_row_offset + col] = static_cast<int8_t>(value);
++              }
++            });
++  });
++}
++
++std::vector<int64_t> make_scale_shape(const torch::Tensor& x) {
++  std::vector<int64_t> scale_shape;
++  scale_shape.reserve(x.dim());
++  for (int64_t i = 0; i < x.dim() - 1; ++i) {
++    scale_shape.push_back(x.size(i));
++  }
++  scale_shape.push_back(1);
++  return scale_shape;
++}
++
++bool shape_matches(
++    const torch::Tensor& tensor,
++    const std::vector<int64_t>& expected) {
++  if (tensor.dim() != static_cast<int64_t>(expected.size())) {
++    return false;
++  }
++  for (int64_t i = 0; i < tensor.dim(); ++i) {
++    if (tensor.size(i) != expected[i]) {
++      return false;
++    }
++  }
++  return true;
++}
++
++void check_quant_input(const torch::Tensor& x, const char* op_name) {
++  TORCH_CHECK(x.is_xpu(), "x must be an XPU tensor");
++  TORCH_CHECK(x.dim() >= 2, "x must have at least 2 dimensions");
++  TORCH_CHECK(
++      x.scalar_type() == torch::kFloat32 || x.scalar_type() == torch::kFloat16 ||
++          x.scalar_type() == torch::kBFloat16,
++      op_name,
++      " only supports fp32, fp16, and bf16 inputs, got ",
++      x.scalar_type());
++}
++
++void check_out_tensor(
++    const torch::Tensor& x,
++    const torch::Tensor& tensor,
++    const char* tensor_name,
++    c10::ScalarType expected_dtype,
++    const std::vector<int64_t>& expected_shape,
++    const char* op_name) {
++  TORCH_CHECK(tensor.is_xpu(), tensor_name, " must be an XPU tensor");
++  TORCH_CHECK(
++      tensor.device() == x.device(),
++      tensor_name,
++      " must be on the same XPU device as x");
++  TORCH_CHECK(
++      tensor.scalar_type() == expected_dtype,
++      tensor_name,
++      " has wrong dtype for ",
++      op_name);
++  TORCH_CHECK(
++      tensor.is_contiguous(),
++      tensor_name,
++      " must be contiguous for ",
++      op_name);
++  TORCH_CHECK(
++      shape_matches(tensor, expected_shape),
++      tensor_name,
++      " has wrong shape for ",
++      op_name);
++}
++
++void check_quant_out_tensors(
++    const torch::Tensor& x,
++    const torch::Tensor& q,
++    const torch::Tensor& scales,
++    const std::vector<int64_t>& q_shape,
++    const char* op_name) {
++  TORCH_CHECK(
++      x.is_contiguous(),
++      op_name,
++      " requires contiguous x to avoid hidden out-variant allocation");
++  check_out_tensor(x, q, "q", torch::kInt8, q_shape, op_name);
++  check_out_tensor(
++      x, scales, "scales", torch::kFloat32, make_scale_shape(x), op_name);
++}
++
++}  // namespace
++
++std::tuple<torch::Tensor, torch::Tensor> per_token_quant_int8_xpu(
++    const torch::Tensor& x) {
++  check_quant_input(x, "per_token_quant_int8_xpu");
++
++  auto x_contig = x.contiguous();
++  const int64_t cols = x_contig.size(-1);
++  const int64_t rows = x_contig.numel() / cols;
++
++  auto q = torch::empty_like(x_contig, x_contig.options().dtype(torch::kInt8));
++
++  std::vector<int64_t> scale_shape = make_scale_shape(x_contig);
++  auto scales = torch::empty(scale_shape, x_contig.options().dtype(torch::kFloat32));
++
++  if (rows == 0 || cols == 0) {
++    return {q, scales};
++  }
++
++  if (x_contig.scalar_type() == torch::kFloat32) {
++    launch_per_token_quant_int8(
++        x_contig.data_ptr<float>(), q.data_ptr<int8_t>(), scales.data_ptr<float>(),
++        rows, cols);
++  } else if (x_contig.scalar_type() == torch::kFloat16) {
++    launch_per_token_quant_int8(
++        reinterpret_cast<const sycl::half*>(x_contig.data_ptr()),
++        q.data_ptr<int8_t>(),
++        scales.data_ptr<float>(),
++        rows,
++        cols);
++  } else {
++    launch_per_token_quant_int8(
++        reinterpret_cast<const sycl::ext::oneapi::bfloat16*>(x_contig.data_ptr()),
++        q.data_ptr<int8_t>(),
++        scales.data_ptr<float>(),
++        rows,
++        cols);
++  }
++
++  return {q, scales};
++}
++
++std::tuple<torch::Tensor, torch::Tensor> per_token_quant_int8_xpu_out(
++    const torch::Tensor& x,
++    torch::Tensor& q,
++    torch::Tensor& scales) {
++  check_quant_input(x, "per_token_quant_int8_xpu_out");
++  std::vector<int64_t> q_shape = x.sizes().vec();
++  check_quant_out_tensors(x, q, scales, q_shape, "per_token_quant_int8_xpu_out");
++
++  const int64_t cols = x.size(-1);
++  const int64_t rows = x.numel() / cols;
++  if (rows == 0 || cols == 0) {
++    return {q, scales};
++  }
++
++  if (x.scalar_type() == torch::kFloat32) {
++    launch_per_token_quant_int8(
++        x.data_ptr<float>(), q.data_ptr<int8_t>(), scales.data_ptr<float>(),
++        rows, cols);
++  } else if (x.scalar_type() == torch::kFloat16) {
++    launch_per_token_quant_int8(
++        reinterpret_cast<const sycl::half*>(x.data_ptr()),
++        q.data_ptr<int8_t>(),
++        scales.data_ptr<float>(),
++        rows,
++        cols);
++  } else {
++    launch_per_token_quant_int8(
++        reinterpret_cast<const sycl::ext::oneapi::bfloat16*>(x.data_ptr()),
++        q.data_ptr<int8_t>(),
++        scales.data_ptr<float>(),
++        rows,
++        cols);
++  }
++
++  return {q, scales};
++}
++
++std::tuple<torch::Tensor, torch::Tensor> silu_and_mul_quant_int8_xpu(
++    const torch::Tensor& x) {
++  check_quant_input(x, "silu_and_mul_quant_int8_xpu");
++
++  auto x_contig = x.contiguous();
++  const int64_t input_cols = x_contig.size(-1);
++  TORCH_CHECK(
++      input_cols % 2 == 0,
++      "silu_and_mul_quant_int8_xpu expects an even last dimension, got ",
++      input_cols);
++  const int64_t cols = input_cols / 2;
++  const int64_t rows = x_contig.numel() / input_cols;
++
++  std::vector<int64_t> q_shape;
++  q_shape.reserve(x_contig.dim());
++  for (int64_t i = 0; i < x_contig.dim() - 1; ++i) {
++    q_shape.push_back(x_contig.size(i));
++  }
++  q_shape.push_back(cols);
++
++  auto q = torch::empty(q_shape, x_contig.options().dtype(torch::kInt8));
++
++  std::vector<int64_t> scale_shape = make_scale_shape(x_contig);
++  auto scales = torch::empty(scale_shape, x_contig.options().dtype(torch::kFloat32));
++
++  if (rows == 0 || cols == 0) {
++    return {q, scales};
++  }
++
++  if (x_contig.scalar_type() == torch::kFloat32) {
++    launch_silu_and_mul_quant_int8(
++        x_contig.data_ptr<float>(), q.data_ptr<int8_t>(), scales.data_ptr<float>(),
++        rows, cols);
++  } else if (x_contig.scalar_type() == torch::kFloat16) {
++    launch_silu_and_mul_quant_int8(
++        reinterpret_cast<const sycl::half*>(x_contig.data_ptr()),
++        q.data_ptr<int8_t>(),
++        scales.data_ptr<float>(),
++        rows,
++        cols);
++  } else {
++    launch_silu_and_mul_quant_int8(
++        reinterpret_cast<const sycl::ext::oneapi::bfloat16*>(x_contig.data_ptr()),
++        q.data_ptr<int8_t>(),
++        scales.data_ptr<float>(),
++        rows,
++        cols);
++  }
++
++  return {q, scales};
++}
++
++std::tuple<torch::Tensor, torch::Tensor> silu_and_mul_quant_int8_xpu_out(
++    const torch::Tensor& x,
++    torch::Tensor& q,
++    torch::Tensor& scales) {
++  check_quant_input(x, "silu_and_mul_quant_int8_xpu_out");
++  const int64_t input_cols = x.size(-1);
++  TORCH_CHECK(
++      input_cols % 2 == 0,
++      "silu_and_mul_quant_int8_xpu_out expects an even last dimension, got ",
++      input_cols);
++  const int64_t cols = input_cols / 2;
++
++  std::vector<int64_t> q_shape;
++  q_shape.reserve(x.dim());
++  for (int64_t i = 0; i < x.dim() - 1; ++i) {
++    q_shape.push_back(x.size(i));
++  }
++  q_shape.push_back(cols);
++  check_quant_out_tensors(
++      x, q, scales, q_shape, "silu_and_mul_quant_int8_xpu_out");
++
++  const int64_t rows = x.numel() / input_cols;
++  if (rows == 0 || cols == 0) {
++    return {q, scales};
++  }
++
++  if (x.scalar_type() == torch::kFloat32) {
++    launch_silu_and_mul_quant_int8(
++        x.data_ptr<float>(), q.data_ptr<int8_t>(), scales.data_ptr<float>(),
++        rows, cols);
++  } else if (x.scalar_type() == torch::kFloat16) {
++    launch_silu_and_mul_quant_int8(
++        reinterpret_cast<const sycl::half*>(x.data_ptr()),
++        q.data_ptr<int8_t>(),
++        scales.data_ptr<float>(),
++        rows,
++        cols);
++  } else {
++    launch_silu_and_mul_quant_int8(
++        reinterpret_cast<const sycl::ext::oneapi::bfloat16*>(x.data_ptr()),
++        q.data_ptr<int8_t>(),
++        scales.data_ptr<float>(),
++        rows,
++        cols);
++  }
++
++  return {q, scales};
++}
+diff -ruN '--exclude=.git' '--exclude=build' '--exclude=.deps' /home/haxor/src/vllm-xpu-kernels/csrc/xpu/torch_bindings.cpp /home/haxor/kernels-int8-build/csrc/xpu/torch_bindings.cpp
+--- /home/haxor/src/vllm-xpu-kernels/csrc/xpu/torch_bindings.cpp	2026-08-14 02:10:01.726097932 -0500
++++ /home/haxor/kernels-int8-build/csrc/xpu/torch_bindings.cpp	2026-08-19 18:26:30.626597154 -0500
+@@ -278,6 +278,29 @@
+       "deepseek_fused_indexer_q_rope_mxfp4",
+       torch::kXPU,
+       &deepseek_fused_indexer_q_rope_mxfp4);
++
++  // haxor backport: INT8 lm_head ops
++  xpu_ops.def(
++      "int8_gemm_w8a8(Tensor A, Tensor A_scale, Tensor B, Tensor B_scale, "
++      "ScalarType? out_dtype, Tensor? bias) -> Tensor");
++  xpu_ops.impl("int8_gemm_w8a8", torch::kXPU, &int8_gemm_w8a8);
++
++  xpu_ops.def(
++      "int8_gemm_w8a8_out(Tensor A, Tensor A_scale, Tensor B, Tensor B_scale, "
++      "Tensor! output, Tensor? bias) -> Tensor");
++  xpu_ops.impl("int8_gemm_w8a8_out", torch::kXPU, &int8_gemm_w8a8_out);
++
++  xpu_ops.def("per_token_quant_int8_xpu(Tensor x) -> (Tensor, Tensor)");
++  xpu_ops.impl("per_token_quant_int8_xpu", torch::kXPU, &per_token_quant_int8_xpu);
++
++  xpu_ops.def(
++      "per_token_quant_int8_xpu_out(Tensor x, Tensor! q, Tensor! scales) -> "
++      "(Tensor, Tensor)");
++  xpu_ops.impl(
++      "per_token_quant_int8_xpu_out",
++      torch::kXPU,
++      &per_token_quant_int8_xpu_out);
++
+ }
+ 
+ REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
