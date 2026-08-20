@@ -18,9 +18,27 @@ INT8 head = 66.84 tok/s (see README).
 | CPU | any x86-64 | compile-bound, not runtime-bound |
 | RAM | 64 GB recommended; 32 GB with MAX_JOBS=3 + reduced attention presets (unvalidated) | SYCL AOT units peak 7-12 GB each; the build runs 6 jobs by default |
 | Disk | ~90 GB | toolchain + 18 GB model + build tree |
-| OS | Ubuntu-family (26.04 tested) | driver packages and oneAPI toolchain target Debian derivatives |
+| OS | Ubuntu 26.04 LTS (reference machine); see baseline below | driver packages and oneAPI toolchain target Debian derivatives |
+| Kernel | 7.1.5-070105-generic (reference) | the `xe` module ships in the kernel; see baseline below |
 | Driver | Battlemage-capable `xe` kernel + Intel compute runtime | see docs/drivers.md for pinning and verification |
 | GPU | **Arc Pro B70 (32 GB) only — verified** | other Arc/XPU variants are unverified; the model + fp8/FP16 KV need 32 GB VRAM |
+
+### Reference machine software baseline (the versions that produced the published numbers)
+
+```text
+OS:            Ubuntu 26.04 LTS
+Kernel:        7.1.5-070105-generic (xe driver ships in-kernel with it)
+intel-opencl-icd: 26.22.38646.7 (Intel PPA package)
+intel-ocloc:      26.18.38308.1
+Level Zero GPU:  libze_intel_gpu.so.1.15.38646
+oneAPI:          2025.3 / 2026.x (both build this stack)
+PyTorch:         2.13.0+xpu (only torch tested end to end)
+```
+
+Closely-related versions (same driver line, newer kernel) are expected to
+reproduce within the tolerance band; materially different driver lines are
+unvalidated — record your own versions with `scripts/verify-install.sh`
+and label your numbers accordingly.
 
 ## Reference two-card configuration
 
