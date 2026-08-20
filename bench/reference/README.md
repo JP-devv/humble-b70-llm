@@ -13,7 +13,7 @@ Every JSON here was produced by `scripts/bench-strict.py` /
 | `tp2-mtp4-fp16-79.84-REJECTED.json` | Attempted MTP4; measured and rejected |
 | `quality-fp16-head.json` | Quality gate, FP16 head (baseline parity) |
 | `quality-int8-head.json` | Quality gate, INT8 head (identical pass set) |
-| `warm-vs-cold-methodology-lesson.json` | Same stack under a warm protocol — why warm numbers are not the headline |
+| `methodology-lesson-alternative-stack-cold.json` | Cold run of an alternative serving stack/checkpoint combination (~51 tok/s on the same card): shows that stack and checkpoint choice dominates the number — protocol alone does not explain cross-stack gaps |
 
 Run-to-run variance is expected; compare within the tolerance band
 (`scripts/bench-strict.sh` does this automatically).

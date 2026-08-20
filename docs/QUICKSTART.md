@@ -36,7 +36,7 @@ something we ship claims about until it is built and validated.
 
 ```bash
 bash scripts/model.sh fetch         # 18 GB into ./models/
-bash scripts/model.sh verify        # sha256 vs bench/manifests/model.sha256
+bash scripts/model.sh verify        # fetches the remote index, checks all shard files present + hashes them
 ```
 
 ## 4. Serve
