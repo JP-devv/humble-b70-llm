@@ -1,0 +1,32 @@
+(Worker_TP0 pid=429671) [xpu-step-timing] fwd=841.132ms samp=0.746ms book=57.018ms total=898.896ms num_sched=633 spec_tokens=0
+(Worker_TP1 pid=429672) [xpu-step-timing] fwd=841.038ms samp=0.685ms book=57.080ms total=898.803ms num_sched=633 spec_tokens=0
+(Worker_TP0 pid=429671) [xpu-stage-timing] rank=0 calls=133 bytes=858.85MB d2h=152.20ms gloo=618.59ms h2d=777.51ms staged_total=1548.30ms
+(Worker_TP1 pid=429672) [xpu-stage-timing] rank=1 calls=133 bytes=858.85MB d2h=348.62ms gloo=421.81ms h2d=779.23ms staged_total=1549.65ms
+(Worker_TP0 pid=429671) [xpu-step-timing] fwd=0.297ms samp=32.965ms book=3.573ms total=36.834ms num_sched=4 spec_tokens=3
+(Worker_TP1 pid=429672) [xpu-step-timing] fwd=0.299ms samp=33.134ms book=3.366ms total=36.800ms num_sched=4 spec_tokens=3
+(Worker_TP0 pid=429671) [xpu-stage-timing] rank=0 calls=1 bytes=0.99MB d2h=31.54ms gloo=0.65ms h2d=0.11ms staged_total=32.30ms
+(Worker_TP1 pid=429672) [xpu-stage-timing] rank=1 calls=1 bytes=0.99MB d2h=31.69ms gloo=0.55ms h2d=0.31ms staged_total=32.56ms
+(Worker_TP0 pid=429671) [xpu-step-timing] fwd=0.283ms samp=33.443ms book=3.762ms total=37.488ms num_sched=4 spec_tokens=3
+(Worker_TP1 pid=429672) [xpu-step-timing] fwd=0.288ms samp=33.170ms book=3.985ms total=37.444ms num_sched=4 spec_tokens=3
+(Worker_TP0 pid=429671) [xpu-stage-timing] rank=0 calls=1 bytes=0.99MB d2h=31.59ms gloo=0.70ms h2d=0.12ms staged_total=32.40ms
+(Worker_TP1 pid=429672) [xpu-stage-timing] rank=1 calls=1 bytes=0.99MB d2h=31.60ms gloo=0.62ms h2d=0.33ms staged_total=32.56ms
+(Worker_TP0 pid=429671) [xpu-step-timing] fwd=0.322ms samp=32.799ms book=4.536ms total=37.657ms num_sched=4 spec_tokens=3
+(Worker_TP0 pid=429671) [xpu-stage-timing] rank=0 calls=1 bytes=0.99MB d2h=31.44ms gloo=0.68ms h2d=0.09ms staged_total=32.22ms
+(Worker_TP1 pid=429672) [xpu-step-timing] fwd=0.283ms samp=33.423ms book=3.973ms total=37.679ms num_sched=4 spec_tokens=3
+(Worker_TP1 pid=429672) [xpu-stage-timing] rank=1 calls=1 bytes=0.99MB d2h=31.69ms gloo=0.45ms h2d=0.33ms staged_total=32.47ms
+(Worker_TP1 pid=429672) [xpu-step-timing] fwd=766.817ms samp=0.697ms book=24.694ms total=792.208ms num_sched=633 spec_tokens=0
+(Worker_TP1 pid=429672) [xpu-stage-timing] rank=1 calls=133 bytes=858.85MB d2h=350.65ms gloo=391.42ms h2d=750.32ms staged_total=1492.39ms
+(Worker_TP0 pid=429671) [xpu-step-timing] fwd=766.909ms samp=0.683ms book=24.725ms total=792.317ms num_sched=633 spec_tokens=0
+(Worker_TP0 pid=429671) [xpu-stage-timing] rank=0 calls=133 bytes=858.85MB d2h=151.59ms gloo=583.83ms h2d=745.80ms staged_total=1481.22ms
+(Worker_TP0 pid=429671) [xpu-step-timing] fwd=0.302ms samp=33.229ms book=3.495ms total=37.026ms num_sched=4 spec_tokens=3
+(Worker_TP1 pid=429672) [xpu-step-timing] fwd=0.301ms samp=33.177ms book=3.495ms total=36.972ms num_sched=4 spec_tokens=3
+(Worker_TP0 pid=429671) [xpu-stage-timing] rank=0 calls=1 bytes=0.99MB d2h=31.60ms gloo=0.60ms h2d=0.12ms staged_total=32.31ms
+(Worker_TP1 pid=429672) [xpu-stage-timing] rank=1 calls=1 bytes=0.99MB d2h=31.63ms gloo=0.48ms h2d=0.33ms staged_total=32.43ms
+(Worker_TP0 pid=429671) [xpu-step-timing] fwd=0.281ms samp=32.860ms book=3.514ms total=36.654ms num_sched=4 spec_tokens=3
+(Worker_TP1 pid=429672) [xpu-step-timing] fwd=0.284ms samp=32.999ms book=3.316ms total=36.599ms num_sched=4 spec_tokens=3
+(Worker_TP0 pid=429671) [xpu-stage-timing] rank=0 calls=1 bytes=0.99MB d2h=31.58ms gloo=0.61ms h2d=0.10ms staged_total=32.28ms
+(Worker_TP1 pid=429672) [xpu-stage-timing] rank=1 calls=1 bytes=0.99MB d2h=31.65ms gloo=0.48ms h2d=0.32ms staged_total=32.45ms
+(Worker_TP0 pid=429671) [xpu-step-timing] fwd=0.275ms samp=32.844ms book=3.558ms total=36.677ms num_sched=4 spec_tokens=3
+(Worker_TP1 pid=429672) [xpu-step-timing] fwd=0.282ms samp=32.981ms book=3.366ms total=36.629ms num_sched=4 spec_tokens=3
+(Worker_TP0 pid=429671) [xpu-stage-timing] rank=0 calls=1 bytes=0.99MB d2h=31.62ms gloo=0.56ms h2d=0.10ms staged_total=32.28ms
+(Worker_TP1 pid=429672) [xpu-stage-timing] rank=1 calls=1 bytes=0.99MB d2h=31.63ms gloo=0.49ms h2d=0.32ms staged_total=32.44ms

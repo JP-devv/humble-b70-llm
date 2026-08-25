@@ -1,0 +1,268 @@
+--- /tmp/tmp.EyOeZjQG2X/vllm/distributed/device_communicators/xpu_communicator.py	2026-08-23 18:33:40.298539568 -0500
++++ HOST/humble-b70-llm/src/vllm/vllm/distributed/device_communicators/xpu_communicator.py	2026-08-23 18:04:48.427370241 -0500
+@@ -3,6 +3,7 @@
+ 
+ 
+ import os
++import time
+ 
+ import torch
+ import torch.distributed as dist
+@@ -24,6 +25,51 @@
+     os.environ.get("VLLM_XPU_HOST_STAGED_MIN_BYTES", str(1 * 1024 * 1024))
+ )
+ 
++# VLLM_XPU_STAGE_TIMING=1: cumulative host-side wall-time stats for the
++# host-staged collective path (perf_counter around each blocking phase).
++# Host-side only: no tensor .item(), no stream sync, so decode graph capture
++# (sizes 1-8) is unaffected. Drained once per engine step by
++# gpu_model_runner's VLLM_XPU_STEP_TIMING channel.
++_STAGE_TIMING = os.environ.get("VLLM_XPU_STAGE_TIMING", "0") == "1"
++
++
++class _StageTimingStats:
++    __slots__ = ("calls", "bytes_moved", "d2h_ms", "gloo_ms", "h2d_ms")
++
++    def __init__(self):
++        self.calls = 0
++        self.bytes_moved = 0
++        self.d2h_ms = 0.0
++        self.gloo_ms = 0.0
++        self.h2d_ms = 0.0
++
++    def add(self, nbytes: int, d2h_ms: float, gloo_ms: float,
++            h2d_ms: float) -> None:
++        self.calls += 1
++        self.bytes_moved += nbytes
++        self.d2h_ms += d2h_ms
++        self.gloo_ms += gloo_ms
++        self.h2d_ms += h2d_ms
++
++    def reset(self) -> None:
++        self.calls = 0
++        self.bytes_moved = 0
++        self.d2h_ms = 0.0
++        self.gloo_ms = 0.0
++        self.h2d_ms = 0.0
++
++
++_STAGE_STATS = _StageTimingStats()
++
++
++def get_and_reset_stage_stats() -> tuple[int, int, float, float, float]:
++    """Return (calls, bytes_moved, d2h_ms, gloo_ms, h2d_ms) since the last
++    drain and reset. Engine-thread only; no synchronization."""
++    s = _STAGE_STATS
++    out = (s.calls, s.bytes_moved, s.d2h_ms, s.gloo_ms, s.h2d_ms)
++    s.reset()
++    return out
++
+ 
+ class XpuCommunicator(DeviceCommunicatorBase):
+     def __init__(
+@@ -83,6 +129,18 @@
+ 
+     def _staged_all_reduce(self, output: torch.Tensor) -> torch.Tensor:
+         buf = self._pinned(output.shape, output.dtype)
++        if _STAGE_TIMING:
++            nbytes = output.numel() * output.element_size()
++            t0 = time.perf_counter()
++            buf.copy_(output, non_blocking=False)
++            t1 = time.perf_counter()
++            dist.all_reduce(buf, group=self.cpu_group)
++            t2 = time.perf_counter()
++            output.copy_(buf, non_blocking=False)
++            t3 = time.perf_counter()
++            _STAGE_STATS.add(nbytes, (t1 - t0) * 1e3, (t2 - t1) * 1e3,
++                             (t3 - t2) * 1e3)
++            return output
+         buf.copy_(output, non_blocking=False)
+         dist.all_reduce(buf, group=self.cpu_group)
+         output.copy_(buf, non_blocking=False)
+@@ -91,6 +149,21 @@
+     def _staged_all_gather(self, output: torch.Tensor,
+                            input_: torch.Tensor) -> None:
+         inbuf = self._pinned(input_.shape, input_.dtype)
++        if _STAGE_TIMING:
++            nbytes = input_.numel() * input_.element_size()
++            t0 = time.perf_counter()
++            inbuf.copy_(input_, non_blocking=False)
++            t1 = time.perf_counter()
++            outbuf = self._pinned((self.world_size,) + tuple(inbuf.shape),
++                                  input_.dtype)
++            dist.all_gather(list(outbuf.unbind(0)), inbuf,
++                            group=self.cpu_group)
++            t2 = time.perf_counter()
++            output.copy_(outbuf.reshape(output.shape), non_blocking=False)
++            t3 = time.perf_counter()
++            _STAGE_STATS.add(nbytes, (t1 - t0) * 1e3, (t2 - t1) * 1e3,
++                             (t3 - t2) * 1e3)
++            return
+         inbuf.copy_(input_, non_blocking=False)
+         outbuf = self._pinned((self.world_size,) + tuple(inbuf.shape),
+                               input_.dtype)
+@@ -100,6 +173,19 @@
+     def _staged_reduce_scatter(self, output: torch.Tensor,
+                                input_: torch.Tensor) -> None:
+         inbuf = self._pinned(input_.shape, input_.dtype)
++        if _STAGE_TIMING:
++            nbytes = input_.numel() * input_.element_size()
++            t0 = time.perf_counter()
++            inbuf.copy_(input_, non_blocking=False)
++            t1 = time.perf_counter()
++            outbuf = self._pinned(output.shape, output.dtype)
++            dist.reduce_scatter_tensor(outbuf, inbuf, group=self.cpu_group)
++            t2 = time.perf_counter()
++            output.copy_(outbuf, non_blocking=False)
++            t3 = time.perf_counter()
++            _STAGE_STATS.add(nbytes, (t1 - t0) * 1e3, (t2 - t1) * 1e3,
++                             (t3 - t2) * 1e3)
++            return
+         inbuf.copy_(input_, non_blocking=False)
+         outbuf = self._pinned(output.shape, output.dtype)
+         dist.reduce_scatter_tensor(outbuf, inbuf, group=self.cpu_group)
+@@ -269,6 +355,20 @@
+     def broadcast(self, input_: torch.Tensor, src: int = 0) -> None:
+         if self._needs_staging(input_):
+             buf = self._pinned(input_.shape, input_.dtype)
++            if _STAGE_TIMING:
++                nbytes = input_.numel() * input_.element_size()
++                t0 = time.perf_counter()
++                if self.rank_in_group == src:
++                    buf.copy_(input_, non_blocking=False)
++                t1 = time.perf_counter()
++                dist.broadcast(buf, src=src, group=self.cpu_group)
++                t2 = time.perf_counter()
++                if self.rank_in_group != src:
++                    input_.copy_(buf, non_blocking=False)
++                t3 = time.perf_counter()
++                _STAGE_STATS.add(nbytes, (t1 - t0) * 1e3, (t2 - t1) * 1e3,
++                                 (t3 - t2) * 1e3)
++                return
+             if self.rank_in_group == src:
+                 buf.copy_(input_, non_blocking=False)
+             dist.broadcast(buf, src=src, group=self.cpu_group)
+@@ -376,6 +476,19 @@
+         orig = getattr(_c10d, name)
+         def wrapped(tensor, *args, **kwargs):
+             if _stage_guard(tensor):
++                if _STAGE_TIMING:
++                    nbytes = tensor.numel() * tensor.element_size()
++                    t0 = time.perf_counter()
++                    cpu = tensor.detach().to("cpu", copy=True)
++                    t1 = time.perf_counter()
++                    kwargs["group"] = _resolve_cpu_group(kwargs.pop("group", None))
++                    orig(cpu, *args, **kwargs)
++                    t2 = time.perf_counter()
++                    tensor.copy_(cpu, non_blocking=False)
++                    t3 = time.perf_counter()
++                    _STAGE_STATS.add(nbytes, (t1 - t0) * 1e3, (t2 - t1) * 1e3,
++                                     (t3 - t2) * 1e3)
++                    return None
+                 cpu = tensor.detach().to("cpu", copy=True)
+                 kwargs["group"] = _resolve_cpu_group(kwargs.pop("group", None))
+                 orig(cpu, *args, **kwargs)
+@@ -390,6 +503,21 @@
+         orig = getattr(_c10d, name)
+         def wrapped(output, input_, *args, **kwargs):
+             if _stage_guard(input_) or _stage_guard(output):
++                if _STAGE_TIMING:
++                    nbytes = input_.numel() * input_.element_size()
++                    t0 = time.perf_counter()
++                    cpu_in = input_.detach().to("cpu", copy=True)
++                    cpu_out = torch.empty(
++                        (output.shape), dtype=output.dtype, pin_memory=True)
++                    t1 = time.perf_counter()
++                    kwargs["group"] = _resolve_cpu_group(kwargs.pop("group", None))
++                    orig(cpu_out, cpu_in, *args, **kwargs)
++                    t2 = time.perf_counter()
++                    output.copy_(cpu_out, non_blocking=False)
++                    t3 = time.perf_counter()
++                    _STAGE_STATS.add(nbytes, (t1 - t0) * 1e3, (t2 - t1) * 1e3,
++                                     (t3 - t2) * 1e3)
++                    return None
+                 cpu_in = input_.detach().to("cpu", copy=True)
+                 cpu_out = torch.empty(
+                     (output.shape), dtype=output.dtype, pin_memory=True)
+@@ -406,6 +534,24 @@
+         orig = getattr(_c10d, name)
+         def wrapped(tensor_list, tensor, *args, **kwargs):
+             if _stage_guard(tensor):
++                if _STAGE_TIMING:
++                    nbytes = tensor.numel() * tensor.element_size()
++                    t0 = time.perf_counter()
++                    cpu_in = tensor.detach().to("cpu", copy=True)
++                    cpu_list = [
++                        torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
++                        for t in tensor_list
++                    ]
++                    t1 = time.perf_counter()
++                    kwargs["group"] = _resolve_cpu_group(kwargs.pop("group", None))
++                    orig(cpu_list, cpu_in, *args, **kwargs)
++                    t2 = time.perf_counter()
++                    for t, c in zip(tensor_list, cpu_list):
++                        t.copy_(c, non_blocking=False)
++                    t3 = time.perf_counter()
++                    _STAGE_STATS.add(nbytes, (t1 - t0) * 1e3, (t2 - t1) * 1e3,
++                                     (t3 - t2) * 1e3)
++                    return None
+                 cpu_in = tensor.detach().to("cpu", copy=True)
+                 cpu_list = [
+                     torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
+@@ -425,6 +571,21 @@
+         orig = getattr(_c10d, name)
+         def wrapped(output, input_, *args, **kwargs):
+             if _stage_guard(input_) or _stage_guard(output):
++                if _STAGE_TIMING:
++                    nbytes = input_.numel() * input_.element_size()
++                    t0 = time.perf_counter()
++                    cpu_in = input_.detach().to("cpu", copy=True)
++                    cpu_out = torch.empty(
++                        output.shape, dtype=output.dtype, pin_memory=True)
++                    t1 = time.perf_counter()
++                    kwargs["group"] = _resolve_cpu_group(kwargs.pop("group", None))
++                    orig(cpu_out, cpu_in, *args, **kwargs)
++                    t2 = time.perf_counter()
++                    output.copy_(cpu_out, non_blocking=False)
++                    t3 = time.perf_counter()
++                    _STAGE_STATS.add(nbytes, (t1 - t0) * 1e3, (t2 - t1) * 1e3,
++                                     (t3 - t2) * 1e3)
++                    return None
+                 cpu_in = input_.detach().to("cpu", copy=True)
+                 cpu_out = torch.empty(
+                     output.shape, dtype=output.dtype, pin_memory=True)
+--- /tmp/tmp.EyOeZjQG2X/vllm/v1/worker/gpu_model_runner.py	2026-08-23 18:33:40.299302952 -0500
++++ HOST/humble-b70-llm/src/vllm/vllm/v1/worker/gpu_model_runner.py	2026-08-23 18:04:49.222371322 -0500
+@@ -4866,6 +4866,32 @@
+                 ),
+                 flush=True,
+             )
++            if os.environ.get("VLLM_XPU_STAGE_TIMING", "0") == "1":
++                # Drain the host-staged collective accumulator accumulated
++                # since the previous step (see xpu_communicator). Host-side
++                # counters only; safe under decode graph capture.
++                from vllm.distributed.device_communicators.xpu_communicator import (
++                    get_and_reset_stage_stats,
++                )
++                _sc, _sb, _sd2h, _sgloo, _sh2d = get_and_reset_stage_stats()
++                try:
++                    _rk = get_tp_group().rank_in_group
++                except Exception:
++                    _rk = -1
++                print(
++                    "[xpu-stage-timing] rank=%d calls=%d bytes=%.2fMB"
++                    " d2h=%.2fms gloo=%.2fms h2d=%.2fms staged_total=%.2fms"
++                    % (
++                        _rk,
++                        _sc,
++                        _sb / 1e6,
++                        _sd2h,
++                        _sgloo,
++                        _sh2d,
++                        _sd2h + _sgloo + _sh2d,
++                    ),
++                    flush=True,
++                )
+ 
+         if draft_after_bookkeeping:
+             # ngram and other speculative decoding methods use the sampled

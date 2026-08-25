@@ -1,0 +1,98 @@
+{
+  "model": "Qwen3.8-27B-INT8-W8A8",
+  "template": "sharp-xhighfix",
+  "effort": "xhigh",
+  "when": "2026-08-21T14:01:27Z",
+  "wifi_cells": [
+    {
+      "closed": false,
+      "cjk": false,
+      "runaway": false,
+      "content_len": 0,
+      "reason_len": 5583,
+      "t": 36.0
+    },
+    {
+      "closed": false,
+      "cjk": false,
+      "runaway": false,
+      "content_len": 0,
+      "reason_len": 8439,
+      "t": 55.8
+    },
+    {
+      "closed": false,
+      "cjk": true,
+      "runaway": false,
+      "content_len": 0,
+      "reason_len": 6758,
+      "t": 59.1
+    },
+    {
+      "closed": false,
+      "cjk": true,
+      "runaway": false,
+      "content_len": 0,
+      "reason_len": 5828,
+      "t": 43.2
+    },
+    {
+      "closed": true,
+      "cjk": false,
+      "runaway": false,
+      "content_len": 159,
+      "reason_len": 5000,
+      "t": 33.8
+    }
+  ],
+  "needle_16k": {
+    "found": true,
+    "content_len": 27,
+    "t": 18.1
+  },
+  "agentic_turns": [
+    {
+      "closed": true,
+      "cjk": false,
+      "runaway": false,
+      "len": 271,
+      "t": 12.5
+    },
+    {
+      "closed": true,
+      "cjk": false,
+      "runaway": false,
+      "len": 1148,
+      "t": 8.9
+    },
+    {
+      "closed": true,
+      "cjk": false,
+      "runaway": false,
+      "len": 512,
+      "t": 14.6
+    },
+    {
+      "closed": true,
+      "cjk": false,
+      "runaway": false,
+      "len": 1924,
+      "t": 13.6
+    },
+    {
+      "closed": true,
+      "cjk": true,
+      "runaway": false,
+      "len": 1229,
+      "t": 15.2
+    },
+    {
+      "closed": false,
+      "cjk": false,
+      "runaway": false,
+      "len": 0,
+      "t": 6.3
+    }
+  ],
+  "gate_passed": false
+}

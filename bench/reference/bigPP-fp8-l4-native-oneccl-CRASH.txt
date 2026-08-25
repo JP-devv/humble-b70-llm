@@ -1,0 +1,26 @@
+# bigPP-fp8 L4 cell (VLLM_XPU_HOST_STAGED_COLLECTIVES=0, everything native oneCCL, CCL_ATL_TRANSPORT=ofi)
+# 2026-08-23T23:29:22Z
+RESULT: boot crash at engine init (profile/dummy pass hits >=1MB native all_reduce).
+
+(Worker_TP1 pid=380539) ERROR 08-23 18:27:22 [multiproc_executor.py:1033]   File "HOST/.venvs/vllm-xpu/lib/python3.12/site-packages/torch/distributed/distributed_c10d.py", line 3245, in all_reduce
+(Worker_TP1 pid=380539) ERROR 08-23 18:27:22 [multiproc_executor.py:1033]     work = group.allreduce([tensor], opts)
+(Worker_TP1 pid=380539) ERROR 08-23 18:27:22 [multiproc_executor.py:1033]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP1 pid=380539) ERROR 08-23 18:27:22 [multiproc_executor.py:1033] RuntimeError: oneCCL: ze_call.cpp:28 do_call: EXCEPTION: ze error at zeMemOpenIpcHandle, code: ZE_RESULT_ERROR_INVALID_ARGUMENT
+(Worker_TP1 pid=380539) ERROR 08-23 18:27:22 [multiproc_executor.py:1033] Traceback (most recent call last):
+--
+(Worker_TP0 pid=380538) ERROR 08-23 18:27:22 [multiproc_executor.py:1033]   File "HOST/.venvs/vllm-xpu/lib/python3.12/site-packages/torch/distributed/distributed_c10d.py", line 3245, in all_reduce
+(Worker_TP0 pid=380538) ERROR 08-23 18:27:22 [multiproc_executor.py:1033]     work = group.allreduce([tensor], opts)
+(Worker_TP0 pid=380538) ERROR 08-23 18:27:22 [multiproc_executor.py:1033]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP0 pid=380538) ERROR 08-23 18:27:22 [multiproc_executor.py:1033] RuntimeError: oneCCL: ze_call.cpp:28 do_call: EXCEPTION: ze error at zeMemOpenIpcHandle, code: ZE_RESULT_ERROR_INVALID_ARGUMENT
+(Worker_TP0 pid=380538) ERROR 08-23 18:27:22 [multiproc_executor.py:1033] Traceback (most recent call last):
+--
+(Worker_TP1 pid=380539) ERROR 08-23 18:27:22 [multiproc_executor.py:1033]   File "HOST/.venvs/vllm-xpu/lib/python3.12/site-packages/torch/distributed/distributed_c10d.py", line 3245, in all_reduce
+(Worker_TP1 pid=380539) ERROR 08-23 18:27:22 [multiproc_executor.py:1033]     work = group.allreduce([tensor], opts)
+(Worker_TP1 pid=380539) ERROR 08-23 18:27:22 [multiproc_executor.py:1033]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_TP1 pid=380539) ERROR 08-23 18:27:22 [multiproc_executor.py:1033] RuntimeError: oneCCL: ze_call.cpp:28 do_call: EXCEPTION: ze error at zeMemOpenIpcHandle, code: ZE_RESULT_ERROR_INVALID_ARGUMENT
+(Worker_TP1 pid=380539) ERROR 08-23 18:27:22 [multiproc_executor.py:1033] 
+--
+(Worker_TP0 pid=380538) ERROR 08-23 18:27:22 [multiproc_executor.py:1033]   File "HOST/.venvs/vllm-xpu/lib/python3.12/site-packages/torch/distributed/distributed_c10d.py", line 3245, in all_reduce
+(Worker_TP0 pid=380538) ERROR 08-23 18:27:22 [multiproc_executor.py:1033]     work = group.allreduce([tensor], opts)
+
+(EngineCore pid=380389) ERROR 08-23 18:27:23 [multiproc_executor.py:310] Worker proc VllmWorker-0 died unexpectedly (exit code: None), shutting down executor.

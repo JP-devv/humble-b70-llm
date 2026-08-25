@@ -1,0 +1,67 @@
+{
+ "args": {
+  "base_url": "http://127.0.0.1:19622",
+  "model": "Qwen3.8-27B-UNC-FP8",
+  "sizes": "240,633,8192",
+  "reps": 2,
+  "max_tokens": 4,
+  "seed": 777,
+  "out": "$HOME/bench-results/bigPP-fp8-final-smoke.json"
+ },
+ "rows": [
+  {
+   "target_size": 240,
+   "prompt_tokens": 240,
+   "cached_tokens": 0,
+   "ttft_ms": 356.8720549956197,
+   "wall_s": 0.47791524000058416,
+   "pp_tok_s": 672.5099279710926,
+   "rep": 0
+  },
+  {
+   "target_size": 240,
+   "prompt_tokens": 240,
+   "cached_tokens": 0,
+   "ttft_ms": null,
+   "wall_s": 0.20882093199179508,
+   "pp_tok_s": null,
+   "rep": 1
+  },
+  {
+   "target_size": 633,
+   "prompt_tokens": 633,
+   "cached_tokens": 0,
+   "ttft_ms": 511.48395099153277,
+   "wall_s": 0.5931195470038801,
+   "pp_tok_s": 1237.5754875063105,
+   "rep": 0
+  },
+  {
+   "target_size": 633,
+   "prompt_tokens": 633,
+   "cached_tokens": 0,
+   "ttft_ms": 496.9475340039935,
+   "wall_s": 0.5778106560028391,
+   "pp_tok_s": 1273.776317793164,
+   "rep": 1
+  },
+  {
+   "target_size": 8192,
+   "prompt_tokens": 8192,
+   "cached_tokens": 0,
+   "ttft_ms": 5204.766670009121,
+   "wall_s": 5.284473699997761,
+   "pp_tok_s": 1573.9418343580892,
+   "rep": 0
+  },
+  {
+   "target_size": 8192,
+   "prompt_tokens": 8192,
+   "cached_tokens": 0,
+   "ttft_ms": 5075.337567002862,
+   "wall_s": 5.115068879997125,
+   "pp_tok_s": 1614.0798305239862,
+   "rep": 1
+  }
+ ]
+}

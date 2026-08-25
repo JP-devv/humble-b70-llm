@@ -1,0 +1,31 @@
+{
+ "args": {
+  "base_url": "http://127.0.0.1:19622",
+  "model": "Qwen3.8-27B-UNC-FP8",
+  "sizes": "32768",
+  "reps": 2,
+  "max_tokens": 4,
+  "seed": 932768,
+  "out": "$HOME/bench-results/bigPP-fp8-l5-probe-32768.json"
+ },
+ "rows": [
+  {
+   "target_size": 32768,
+   "prompt_tokens": 32768,
+   "cached_tokens": 0,
+   "ttft_ms": 22205.591894999998,
+   "wall_s": 22.283727628000065,
+   "pp_tok_s": 1475.6643351343553,
+   "rep": 0
+  },
+  {
+   "target_size": 32768,
+   "prompt_tokens": 32768,
+   "cached_tokens": 0,
+   "ttft_ms": 22011.781487000007,
+   "wall_s": 22.134091917999967,
+   "pp_tok_s": 1488.6573364973904,
+   "rep": 1
+  }
+ ]
+}

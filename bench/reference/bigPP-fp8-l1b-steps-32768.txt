@@ -1,0 +1,64 @@
+(Worker_TP1 pid=463352) [xpu-step-timing] fwd=4847.320ms samp=1.069ms book=205.182ms total=5053.571ms num_sched=8000 spec_tokens=0
+(Worker_TP0 pid=463351) [xpu-step-timing] fwd=4847.283ms samp=0.836ms book=205.460ms total=5053.580ms num_sched=8000 spec_tokens=0
+(Worker_TP1 pid=463352) [xpu-stage-timing] rank=1 calls=133 bytes=10854.40MB d2h=4241.41ms gloo=629.60ms h2d=4849.27ms staged_total=9720.28ms
+(Worker_TP0 pid=463351) [xpu-stage-timing] rank=0 calls=133 bytes=10854.40MB d2h=1766.37ms gloo=3125.15ms h2d=4852.57ms staged_total=9744.09ms
+(Worker_TP0 pid=463351) [xpu-step-timing] fwd=5099.045ms samp=0.798ms book=204.838ms total=5304.682ms num_sched=8000 spec_tokens=0
+(Worker_TP0 pid=463351) [xpu-stage-timing] rank=0 calls=133 bytes=10854.40MB d2h=2052.59ms gloo=3137.55ms h2d=5166.50ms staged_total=10356.63ms
+(Worker_TP1 pid=463352) [xpu-step-timing] fwd=5098.012ms samp=0.780ms book=204.901ms total=5303.694ms num_sched=8000 spec_tokens=0
+(Worker_TP1 pid=463352) [xpu-stage-timing] rank=1 calls=133 bytes=10854.40MB d2h=4537.01ms gloo=637.15ms h2d=5166.20ms staged_total=10340.36ms
+(Worker_TP0 pid=463351) [xpu-step-timing] fwd=5382.680ms samp=0.839ms book=221.440ms total=5604.959ms num_sched=8000 spec_tokens=0
+(Worker_TP0 pid=463351) [xpu-stage-timing] rank=0 calls=133 bytes=10854.40MB d2h=2350.54ms gloo=3141.97ms h2d=5467.13ms staged_total=10959.64ms
+(Worker_TP1 pid=463352) [xpu-step-timing] fwd=5382.673ms samp=0.724ms book=221.598ms total=5604.995ms num_sched=8000 spec_tokens=0
+(Worker_TP1 pid=463352) [xpu-stage-timing] rank=1 calls=133 bytes=10854.40MB d2h=4842.04ms gloo=629.81ms h2d=5466.56ms staged_total=10938.41ms
+(Worker_TP1 pid=463352) [xpu-step-timing] fwd=4439.575ms samp=0.811ms book=184.465ms total=4624.850ms num_sched=6400 spec_tokens=0
+(Worker_TP0 pid=463351) [xpu-step-timing] fwd=4439.739ms samp=0.801ms book=184.465ms total=4625.006ms num_sched=6400 spec_tokens=0
+(Worker_TP1 pid=463352) [xpu-stage-timing] rank=1 calls=133 bytes=8683.52MB d2h=4000.30ms gloo=506.68ms h2d=4507.55ms staged_total=9014.54ms
+(Worker_TP0 pid=463351) [xpu-stage-timing] rank=0 calls=133 bytes=8683.52MB d2h=2068.80ms gloo=2451.85ms h2d=4507.55ms staged_total=9028.19ms
+(Worker_TP0 pid=463351) [xpu-step-timing] fwd=1728.160ms samp=0.793ms book=73.056ms total=1802.009ms num_sched=2368 spec_tokens=0
+(Worker_TP1 pid=463352) [xpu-step-timing] fwd=1728.095ms samp=0.769ms book=73.089ms total=1801.953ms num_sched=2368 spec_tokens=0
+(Worker_TP0 pid=463351) [xpu-stage-timing] rank=0 calls=133 bytes=3212.90MB d2h=863.44ms gloo=855.23ms h2d=1722.81ms staged_total=3441.48ms
+(Worker_TP1 pid=463352) [xpu-stage-timing] rank=1 calls=133 bytes=3212.90MB d2h=1529.51ms gloo=183.78ms h2d=1722.52ms staged_total=3435.82ms
+(Worker_TP0 pid=463351) [xpu-step-timing] fwd=0.302ms samp=36.115ms book=4.007ms total=40.423ms num_sched=4 spec_tokens=3
+(Worker_TP1 pid=463352) [xpu-step-timing] fwd=0.304ms samp=36.212ms book=3.885ms total=40.400ms num_sched=4 spec_tokens=3
+(Worker_TP0 pid=463351) [xpu-stage-timing] rank=0 calls=1 bytes=0.99MB d2h=34.63ms gloo=0.60ms h2d=0.13ms staged_total=35.36ms
+(Worker_TP1 pid=463352) [xpu-stage-timing] rank=1 calls=1 bytes=0.99MB d2h=34.68ms gloo=0.56ms h2d=0.32ms staged_total=35.56ms
+(Worker_TP0 pid=463351) [xpu-step-timing] fwd=0.293ms samp=35.995ms book=4.838ms total=41.125ms num_sched=4 spec_tokens=3
+(Worker_TP1 pid=463352) [xpu-step-timing] fwd=0.305ms samp=36.575ms book=4.279ms total=41.159ms num_sched=4 spec_tokens=3
+(Worker_TP0 pid=463351) [xpu-stage-timing] rank=0 calls=1 bytes=0.99MB d2h=34.53ms gloo=0.75ms h2d=0.10ms staged_total=35.38ms
+(Worker_TP1 pid=463352) [xpu-stage-timing] rank=1 calls=1 bytes=0.99MB d2h=34.69ms gloo=0.54ms h2d=0.33ms staged_total=35.56ms
+(Worker_TP1 pid=463352) [xpu-step-timing] fwd=0.308ms samp=36.379ms book=3.859ms total=40.547ms num_sched=4 spec_tokens=3
+(Worker_TP0 pid=463351) [xpu-step-timing] fwd=0.295ms samp=36.324ms book=3.974ms total=40.594ms num_sched=4 spec_tokens=3
+(Worker_TP1 pid=463352) [xpu-stage-timing] rank=1 calls=1 bytes=0.99MB d2h=34.69ms gloo=0.73ms h2d=0.32ms staged_total=35.74ms
+(Worker_TP0 pid=463351) [xpu-stage-timing] rank=0 calls=1 bytes=0.99MB d2h=34.59ms gloo=0.88ms h2d=0.16ms staged_total=35.62ms
+(Worker_TP1 pid=463352) [xpu-step-timing] fwd=4827.689ms samp=0.781ms book=184.946ms total=5013.416ms num_sched=8000 spec_tokens=0
+(Worker_TP0 pid=463351) [xpu-step-timing] fwd=4827.762ms samp=0.890ms book=184.832ms total=5013.484ms num_sched=8000 spec_tokens=0
+(Worker_TP1 pid=463352) [xpu-stage-timing] rank=1 calls=133 bytes=10854.40MB d2h=4256.19ms gloo=628.68ms h2d=4879.10ms staged_total=9763.97ms
+(Worker_TP0 pid=463351) [xpu-stage-timing] rank=0 calls=133 bytes=10854.40MB d2h=1764.55ms gloo=3134.87ms h2d=4877.64ms staged_total=9777.07ms
+(Worker_TP0 pid=463351) [xpu-step-timing] fwd=5099.107ms samp=0.803ms book=202.524ms total=5302.434ms num_sched=8000 spec_tokens=0
+(Worker_TP0 pid=463351) [xpu-stage-timing] rank=0 calls=133 bytes=10854.40MB d2h=2055.91ms gloo=3130.09ms h2d=5164.77ms staged_total=10350.77ms
+(Worker_TP1 pid=463352) [xpu-step-timing] fwd=5099.023ms samp=0.776ms book=202.580ms total=5302.379ms num_sched=8000 spec_tokens=0
+(Worker_TP1 pid=463352) [xpu-stage-timing] rank=1 calls=133 bytes=10854.40MB d2h=4546.28ms gloo=628.82ms h2d=5167.55ms staged_total=10342.66ms
+(Worker_TP1 pid=463352) [xpu-step-timing] fwd=5378.432ms samp=0.769ms book=219.186ms total=5598.387ms num_sched=8000 spec_tokens=0
+(Worker_TP0 pid=463351) [xpu-step-timing] fwd=5379.760ms samp=0.847ms book=219.110ms total=5599.718ms num_sched=8000 spec_tokens=0
+(Worker_TP1 pid=463352) [xpu-stage-timing] rank=1 calls=133 bytes=10854.40MB d2h=4836.07ms gloo=632.63ms h2d=5464.05ms staged_total=10932.75ms
+(Worker_TP0 pid=463351) [xpu-stage-timing] rank=0 calls=133 bytes=10854.40MB d2h=2352.13ms gloo=3133.86ms h2d=5463.99ms staged_total=10949.98ms
+(Worker_TP1 pid=463352) [xpu-step-timing] fwd=4435.811ms samp=0.779ms book=183.485ms total=4620.074ms num_sched=6400 spec_tokens=0
+(Worker_TP0 pid=463351) [xpu-step-timing] fwd=4434.685ms samp=0.798ms book=183.460ms total=4618.943ms num_sched=6400 spec_tokens=0
+(Worker_TP1 pid=463352) [xpu-stage-timing] rank=1 calls=133 bytes=8683.52MB d2h=4000.13ms gloo=498.96ms h2d=4501.97ms staged_total=9001.07ms
+(Worker_TP0 pid=463351) [xpu-stage-timing] rank=0 calls=133 bytes=8683.52MB d2h=2064.52ms gloo=2445.21ms h2d=4497.73ms staged_total=9007.45ms
+(Worker_TP0 pid=463351) [xpu-step-timing] fwd=1727.500ms samp=0.796ms book=67.462ms total=1795.758ms num_sched=2368 spec_tokens=0
+(Worker_TP1 pid=463352) [xpu-step-timing] fwd=1727.459ms samp=0.765ms book=67.501ms total=1795.725ms num_sched=2368 spec_tokens=0
+(Worker_TP0 pid=463351) [xpu-stage-timing] rank=0 calls=133 bytes=3212.90MB d2h=857.22ms gloo=851.37ms h2d=1718.32ms staged_total=3426.90ms
+(Worker_TP1 pid=463352) [xpu-stage-timing] rank=1 calls=133 bytes=3212.90MB d2h=1522.02ms gloo=185.30ms h2d=1721.26ms staged_total=3428.59ms
+(Worker_TP1 pid=463352) [xpu-step-timing] fwd=0.366ms samp=36.270ms book=3.828ms total=40.464ms num_sched=4 spec_tokens=3
+(Worker_TP0 pid=463351) [xpu-step-timing] fwd=0.302ms samp=36.485ms book=3.961ms total=40.748ms num_sched=4 spec_tokens=3
+(Worker_TP1 pid=463352) [xpu-stage-timing] rank=1 calls=1 bytes=0.99MB d2h=34.70ms gloo=0.57ms h2d=0.32ms staged_total=35.59ms
+(Worker_TP0 pid=463351) [xpu-stage-timing] rank=0 calls=1 bytes=0.99MB d2h=34.94ms gloo=0.69ms h2d=0.10ms staged_total=35.74ms
+(Worker_TP0 pid=463351) [xpu-step-timing] fwd=0.289ms samp=35.853ms book=4.013ms total=40.156ms num_sched=4 spec_tokens=3
+(Worker_TP1 pid=463352) [xpu-step-timing] fwd=0.300ms samp=36.104ms book=3.729ms total=40.133ms num_sched=4 spec_tokens=3
+(Worker_TP0 pid=463351) [xpu-stage-timing] rank=0 calls=1 bytes=0.99MB d2h=34.57ms gloo=0.60ms h2d=0.08ms staged_total=35.25ms
+(Worker_TP1 pid=463352) [xpu-stage-timing] rank=1 calls=1 bytes=0.99MB d2h=34.68ms gloo=0.49ms h2d=0.37ms staged_total=35.55ms
+(Worker_TP0 pid=463351) [xpu-step-timing] fwd=0.281ms samp=36.340ms book=3.732ms total=40.354ms num_sched=4 spec_tokens=3
+(Worker_TP1 pid=463352) [xpu-step-timing] fwd=0.290ms samp=36.287ms book=3.714ms total=40.291ms num_sched=4 spec_tokens=3
+(Worker_TP0 pid=463351) [xpu-stage-timing] rank=0 calls=1 bytes=0.99MB d2h=34.64ms gloo=0.87ms h2d=0.19ms staged_total=35.70ms
+(Worker_TP1 pid=463352) [xpu-stage-timing] rank=1 calls=1 bytes=0.99MB d2h=34.72ms gloo=0.73ms h2d=0.31ms staged_total=35.76ms

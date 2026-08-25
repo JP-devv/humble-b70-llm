@@ -1,0 +1,5 @@
+# bigPP-fp8 E0 cell tenants 2026-08-23T23:15:31Z
+vram-track tail (MiB used):
+0 30844
+1 30358
+comfy procs: 13 (cards 0+1, ports 18188/18189, idle)

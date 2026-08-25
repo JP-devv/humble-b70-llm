@@ -1,0 +1,22 @@
+{
+ "args": {
+  "base_url": "http://127.0.0.1:19622",
+  "model": "Qwen3.8-27B-UNC-FP8",
+  "sizes": "32768",
+  "reps": 1,
+  "max_tokens": 4,
+  "seed": 303,
+  "out": "/tmp/bigpp-e0-probe-32768.json"
+ },
+ "rows": [
+  {
+   "target_size": 32768,
+   "prompt_tokens": 32768,
+   "cached_tokens": 0,
+   "ttft_ms": 41386.32018100179,
+   "wall_s": 41.50903517700499,
+   "pp_tok_s": 791.7592058605395,
+   "rep": 0
+  }
+ ]
+}

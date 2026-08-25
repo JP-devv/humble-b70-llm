@@ -1,0 +1,846 @@
+diff --git a/vllm/distributed/device_communicators/xpu_communicator.py b/vllm/distributed/device_communicators/xpu_communicator.py
+index 7ca132824e..a90fc24bdf 100644
+--- a/vllm/distributed/device_communicators/xpu_communicator.py
++++ b/vllm/distributed/device_communicators/xpu_communicator.py
+@@ -2,6 +2,9 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ 
++import os
++import time
++
+ import torch
+ import torch.distributed as dist
+ from torch.distributed import ProcessGroup
+@@ -12,6 +15,240 @@ from .base_device_communicator import DeviceCommunicatorBase
+ 
+ logger = init_logger(__name__)
+ 
++# Host-staged collectives for XPU TP on hosts where cross-device VRAM IPC is
++# unavailable (GPUs on separate PCIe root ports: zeMemOpenIpcHandle fails with
++# ZE_RESULT_ERROR_INVALID_ARGUMENT for cross-device handles). Payloads at or
++# above VLLM_XPU_HOST_STAGED_MIN_BYTES are bounced through pinned host memory
++# over the CPU (gloo) group; small payloads stay on the native device path.
++_HOST_STAGED = os.environ.get("VLLM_XPU_HOST_STAGED_COLLECTIVES", "0") == "1"
++_HOST_STAGED_MIN_BYTES = int(
++    os.environ.get("VLLM_XPU_HOST_STAGED_MIN_BYTES", str(1 * 1024 * 1024))
++)
++
++# VLLM_XPU_STAGE_TIMING=1: cumulative host-side wall-time stats for the
++# host-staged collective path (perf_counter around each blocking phase).
++# Host-side only: no tensor .item(), no stream sync, so decode graph capture
++# (sizes 1-8) is unaffected. Drained once per engine step by
++# gpu_model_runner's VLLM_XPU_STEP_TIMING channel.
++_STAGE_TIMING = os.environ.get("VLLM_XPU_STAGE_TIMING", "0") == "1"
++
++
++class _StageTimingStats:
++    __slots__ = ("calls", "bytes_moved", "d2h_ms", "gloo_ms", "h2d_ms")
++
++    def __init__(self):
++        self.calls = 0
++        self.bytes_moved = 0
++        self.d2h_ms = 0.0
++        self.gloo_ms = 0.0
++        self.h2d_ms = 0.0
++
++    def add(self, nbytes: int, d2h_ms: float, gloo_ms: float,
++            h2d_ms: float) -> None:
++        self.calls += 1
++        self.bytes_moved += nbytes
++        self.d2h_ms += d2h_ms
++        self.gloo_ms += gloo_ms
++        self.h2d_ms += h2d_ms
++
++    def add_phases(self, d2h_ms: float, gloo_ms: float,
++                   h2d_ms: float) -> None:
++        """Phase-only accumulation from the slice worker thread (calls/bytes
++        are counted once per collective on the engine thread)."""
++        self.d2h_ms += d2h_ms
++        self.gloo_ms += gloo_ms
++        self.h2d_ms += h2d_ms
++
++    def reset(self) -> None:
++        self.calls = 0
++        self.bytes_moved = 0
++        self.d2h_ms = 0.0
++        self.gloo_ms = 0.0
++        self.h2d_ms = 0.0
++
++
++_STAGE_STATS = _StageTimingStats()
++
++
++def get_and_reset_stage_stats() -> tuple[int, int, float, float, float]:
++    """Return (calls, bytes_moved, d2h_ms, gloo_ms, h2d_ms) since the last
++    drain and reset. Engine-thread only; no synchronization."""
++    s = _STAGE_STATS
++    out = (s.calls, s.bytes_moved, s.d2h_ms, s.gloo_ms, s.h2d_ms)
++    s.reset()
++    return out
++
++
++# VLLM_XPU_STAGE_SLICE_KB > 0: sliced pipelined staging for host-staged
++# all_reduce (bigPP L1). Each staged all_reduce is split into ~SLICE_KB
++# slices; D2H slice copies are enqueued async with one event per slice, a
++# dedicated worker thread runs the CPU reduce for each slice as its D2H
++# lands, and the engine enqueues each H2D slice as its reduce completes.
++# The engine still host-blocks per slice, but the GPU copy engine no
++# longer idles behind the CPU reduce: wall per collective goes from
++# (D2H + reduce + H2D) toward max(D2H + H2D, reduce) + tails.
++# Correctness: all_reduce is elementwise, so slices are independent; the
++# engine returns only after every H2D is enqueued, keeping consumers
++# stream-ordered exactly as in the blocking path; gloo collectives for
++# one staged all_reduce fully complete before the engine issues anything
++# else on the CPU group, so gloo call ordering across ranks is unchanged.
++# Never runs under decode graph capture (staging only triggers at >= 1 MB
++# payloads, and the graph-captured MTP path routes through the functional
++# wrappers, not this method).
++_STAGE_SLICE_KB = int(os.environ.get("VLLM_XPU_STAGE_SLICE_KB", "0"))
++
++# VLLM_XPU_STAGE_SHM=1: run the per-slice CPU reduce as a 2-rank
++# shared-memory exchange (/dev/shm regions + spin barriers + numpy add)
++# instead of gloo's loopback TCP (~4.6 GB/s measured on the reference
++# host). 2-rank groups only; anything else falls back to gloo. Only used
++# by the sliced path (the segment is sized to one slice).
++_STAGE_SHM = os.environ.get("VLLM_XPU_STAGE_SHM", "0") == "1"
++
++
++class _ShmPair:
++    """Two-rank shared-memory all_reduce for the sliced staged path.
++
++    Segment layout: [4 KiB control][region rank0][region rank1], each
++    region cap_bytes. Exchange with sequence number s: each rank copies
++    its slice into its own region, releases rdy[me]=s, spins for
++    rdy[peer]>=s, adds both regions into the destination (torch CPU add
++    on frombuffer views), releases ack[me]=s, and spins for ack[peer]>=s
++    so no region is overwritten while the peer is still reading. At most
++    one slice of skew between ranks. The add is elementwise and
++    bit-identical to gloo's 2-rank sum (verified in the regression pack).
++    """
++
++    _CTRL = 4096
++    _SPIN_TIMEOUT_S = 60.0
++
++    def __init__(self, cpu_group: ProcessGroup, rank: int, cap_bytes: int):
++        import uuid
++        from multiprocessing import resource_tracker, shared_memory
++
++        import numpy as np
++
++        self._rank = rank
++        self._cap = cap_bytes
++        # Rendezvous on a per-boot random name over the (already up) gloo
++        # group so stale segments from crashed runs can never collide.
++        if rank == 0:
++            tok = torch.tensor(
++                bytearray(uuid.uuid4().hex[:16], "utf-8"), dtype=torch.uint8
++            )
++        else:
++            tok = torch.empty(16, dtype=torch.uint8)
++        dist.broadcast(tok, src=0, group=cpu_group)
++        name = "vllm-stage-" + bytes(tok.tolist()).decode()
++        size = self._CTRL + 2 * cap_bytes
++        if rank == 0:
++            self._gc_stale()
++            self._shm = shared_memory.SharedMemory(
++                name=name, create=True, size=size
++            )
++            np.frombuffer(self._shm.buf, dtype=np.int64,
++                          count=self._CTRL // 8)[:] = 0
++        else:
++            self._shm = None
++            for _ in range(6000):
++                try:
++                    self._shm = shared_memory.SharedMemory(
++                        name=name, create=False
++                    )
++                    break
++                except FileNotFoundError:
++                    time.sleep(0.01)
++            if self._shm is None:
++                raise RuntimeError(
++                    "timed out waiting for shm segment " + name
++                )
++            # The creator owns unlink(); keep the tracker's atexit hook
++            # from unlinking someone else's segment.
++            resource_tracker.unregister(self._shm._name, "shared_memory")
++        ctrl = np.frombuffer(self._shm.buf, dtype=np.int64,
++                             count=self._CTRL // 8)
++        # cache-line separated control words
++        self._rdy = (ctrl[0:1], ctrl[8:9])
++        self._ack = (ctrl[16:17], ctrl[24:25])
++        self._seq = 0
++        self._owner = rank == 0
++        import atexit
++
++        atexit.register(self._cleanup)
++
++    def _gc_stale(self):
++        # Best-effort cleanup of segments leaked by crashed runs
++        # (>1 h old). Only ever called by a rank0 creator.
++        import glob
++
++        now = time.time()
++        for path in glob.glob("/dev/shm/vllm-stage-*"):
++            try:
++                if now - os.path.getmtime(path) > 3600:
++                    os.unlink(path)
++            except OSError:
++                pass
++
++    def _cleanup(self):
++        # Views into the buffer live for the process lifetime, so close()
++        # would raise BufferError; the kernel reclaims the mapping at
++        # exit. The owner just unlinks the name.
++        if self._owner:
++            try:
++                os.unlink("/dev/shm/" + self._shm.name)
++            except OSError:
++                pass
++
++    def _region(self, who: int, dtype, nbytes: int) -> torch.Tensor:
++        off = self._CTRL + who * self._cap
++        return torch.frombuffer(
++            self._shm.buf[off:off + nbytes], dtype=dtype
++        )
++
++    def _spin(self, word, seq: int) -> None:
++        deadline = time.monotonic() + self._SPIN_TIMEOUT_S
++        n = 0
++        while word[0] < seq:
++            n += 1
++            if n & 0x3F == 0:
++                time.sleep(0)  # yield the GIL to the engine thread
++                if time.monotonic() > deadline:
++                    raise RuntimeError(
++                        "shm staged reduce: peer barrier timeout"
++                    )
++
++    def reduce(self, t: torch.Tensor) -> bool:
++        """In-place 2-rank sum; False if unsupported (caller falls back
++        to gloo)."""
++        nbytes = t.numel() * t.element_size()
++        if nbytes > self._cap:
++            return False
++        me = self._rank
++        peer = 1 - me
++        self._seq += 1
++        s = self._seq
++        # torch CPU add on frombuffer views: vectorized half arithmetic,
++        # ~5x faster than numpy fp16 add, and measured bit-identical to
++        # both numpy's fp16 add and gloo's 2-rank sum (all compute the
++        # same per-element float-upcast + round-to-nearest-even).
++        #
++        # inference_mode: `t` is a slice of the pinned staging buffer,
++        # which is allocated during the model forward — under vLLM's
++        # inference_mode — making it an inference tensor. The worker
++        # thread runs outside inference mode, where inplace updates of
++        # inference tensors raise. Re-enter it here.
++        with torch.inference_mode():
++            self._region(me, t.dtype, nbytes).copy_(t)
++            self._rdy[me][0] = s
++            self._spin(self._rdy[peer], s)
++            torch.add(
++                self._region(0, t.dtype, nbytes),
++                self._region(1, t.dtype, nbytes),
++                out=t,
++            )
++        self._ack[me][0] = s
++        self._spin(self._ack[peer], s)
++        return True
++
+ 
+ class XpuCommunicator(DeviceCommunicatorBase):
+     def __init__(
+@@ -26,6 +263,7 @@ class XpuCommunicator(DeviceCommunicatorBase):
+             cpu_group, device, device_group, unique_name, use_all2all=use_all2all
+         )
+         self.ca_comm: None = None
++        self._init_host_staging()
+         if self.use_all2all:
+             if self.all2all_backend in ("naive", "allgather_reducescatter"):
+                 from .all2all import AgRsAll2AllManager
+@@ -45,8 +283,180 @@ class XpuCommunicator(DeviceCommunicatorBase):
+                 self.all2all_manager = AgRsAll2AllManager(self.cpu_group)
+                 logger.info("Using AgRs manager on XPU device.")
+ 
++    def _init_host_staging(self):
++        self._staging_cache: dict = {}
++        self._stage_wq = None
++        self._stage_dq = None
++        self._shm = None
++        if _HOST_STAGED:
++            logger.info(
++                "XpuCommunicator: host-staged collectives enabled "
++                "(threshold=%d bytes, slice_kb=%d, shm=%d)",
++                _HOST_STAGED_MIN_BYTES,
++                _STAGE_SLICE_KB,
++                int(_STAGE_SHM),
++            )
++
++    def _ensure_stage_worker(self):
++        if getattr(self, "_stage_wq", None) is not None:
++            return
++        import queue
++        import threading
++
++        self._stage_wq = queue.Queue()
++        self._stage_dq = queue.Queue()
++        self._stage_wt = threading.Thread(
++            target=self._stage_worker,
++            daemon=True,
++            name="xpu-stage-reduce",
++        )
++        self._stage_wt.start()
++        if _STAGE_SHM and self.world_size == 2:
++            cap = max(_STAGE_SLICE_KB, 64) * 1024
++            self._shm = _ShmPair(self.cpu_group, self.rank_in_group, cap)
++            logger.info(
++                "XpuCommunicator: shm staged reduce ready (cap=%d KiB)",
++                cap // 1024,
++            )
++
++    def _stage_worker(self):
++        while True:
++            item = self._stage_wq.get()
++            if item is None:
++                return
++            try:
++                ev, buf_slice = item
++                if _STAGE_TIMING:
++                    t0 = time.perf_counter()
++                ev.synchronize()
++                if _STAGE_TIMING:
++                    t1 = time.perf_counter()
++                shm = getattr(self, "_shm", None)
++                if shm is None or not shm.reduce(buf_slice):
++                    dist.all_reduce(buf_slice, group=self.cpu_group)
++                if _STAGE_TIMING:
++                    t2 = time.perf_counter()
++                    _STAGE_STATS.add_phases(
++                        (t1 - t0) * 1e3, (t2 - t1) * 1e3, 0.0
++                    )
++                self._stage_dq.put(None)
++            except Exception as e:  # propagate: engine must not hang
++                self._stage_dq.put(e)
++
++    def _staged_all_reduce_sliced(self,
++                                  output: torch.Tensor) -> torch.Tensor:
++        self._ensure_stage_worker()
++        buf = self._pinned(output.shape, output.dtype)
++        flat_out = output.view(-1)
++        flat_buf = buf.view(-1)
++        n = flat_out.numel()
++        per = max(1, (_STAGE_SLICE_KB * 1024) // output.element_size())
++        if _STAGE_TIMING:
++            t0 = time.perf_counter()
++        slices = []
++        for off in range(0, n, per):
++            sl = slice(off, min(off + per, n))
++            slices.append(sl)
++            flat_buf[sl].copy_(flat_out[sl], non_blocking=True)
++            ev = torch.xpu.Event()
++            ev.record()
++            self._stage_wq.put((ev, flat_buf[sl]))
++        # The worker completes slices in FIFO order, so the j-th done
++        # corresponds to slices[j].
++        for sl in slices:
++            res = self._stage_dq.get()
++            if res is not None:
++                raise res
++            flat_out[sl].copy_(flat_buf[sl], non_blocking=True)
++        if _STAGE_TIMING:
++            _STAGE_STATS.add(n * output.element_size(), 0.0, 0.0,
++                             (time.perf_counter() - t0) * 1e3)
++        return output
++
++    def _needs_staging(self, t: torch.Tensor) -> bool:
++        return (
++            _HOST_STAGED
++            and t.numel() * t.element_size() >= _HOST_STAGED_MIN_BYTES
++        )
++
++    def _pinned(self, shape, dtype) -> torch.Tensor:
++        key = (tuple(shape), dtype)
++        buf = self._staging_cache.get(key)
++        if buf is None:
++            buf = torch.empty(shape, dtype=dtype, pin_memory=True)
++            self._staging_cache[key] = buf
++        return buf
++
++    def _staged_all_reduce(self, output: torch.Tensor) -> torch.Tensor:
++        if _STAGE_SLICE_KB > 0 and output.is_contiguous():
++            return self._staged_all_reduce_sliced(output)
++        buf = self._pinned(output.shape, output.dtype)
++        if _STAGE_TIMING:
++            nbytes = output.numel() * output.element_size()
++            t0 = time.perf_counter()
++            buf.copy_(output, non_blocking=False)
++            t1 = time.perf_counter()
++            dist.all_reduce(buf, group=self.cpu_group)
++            t2 = time.perf_counter()
++            output.copy_(buf, non_blocking=False)
++            t3 = time.perf_counter()
++            _STAGE_STATS.add(nbytes, (t1 - t0) * 1e3, (t2 - t1) * 1e3,
++                             (t3 - t2) * 1e3)
++            return output
++        buf.copy_(output, non_blocking=False)
++        dist.all_reduce(buf, group=self.cpu_group)
++        output.copy_(buf, non_blocking=False)
++        return output
++
++    def _staged_all_gather(self, output: torch.Tensor,
++                           input_: torch.Tensor) -> None:
++        inbuf = self._pinned(input_.shape, input_.dtype)
++        if _STAGE_TIMING:
++            nbytes = input_.numel() * input_.element_size()
++            t0 = time.perf_counter()
++            inbuf.copy_(input_, non_blocking=False)
++            t1 = time.perf_counter()
++            outbuf = self._pinned((self.world_size,) + tuple(inbuf.shape),
++                                  input_.dtype)
++            dist.all_gather(list(outbuf.unbind(0)), inbuf,
++                            group=self.cpu_group)
++            t2 = time.perf_counter()
++            output.copy_(outbuf.reshape(output.shape), non_blocking=False)
++            t3 = time.perf_counter()
++            _STAGE_STATS.add(nbytes, (t1 - t0) * 1e3, (t2 - t1) * 1e3,
++                             (t3 - t2) * 1e3)
++            return
++        inbuf.copy_(input_, non_blocking=False)
++        outbuf = self._pinned((self.world_size,) + tuple(inbuf.shape),
++                              input_.dtype)
++        dist.all_gather(list(outbuf.unbind(0)), inbuf, group=self.cpu_group)
++        output.copy_(outbuf.reshape(output.shape), non_blocking=False)
++
++    def _staged_reduce_scatter(self, output: torch.Tensor,
++                               input_: torch.Tensor) -> None:
++        inbuf = self._pinned(input_.shape, input_.dtype)
++        if _STAGE_TIMING:
++            nbytes = input_.numel() * input_.element_size()
++            t0 = time.perf_counter()
++            inbuf.copy_(input_, non_blocking=False)
++            t1 = time.perf_counter()
++            outbuf = self._pinned(output.shape, output.dtype)
++            dist.reduce_scatter_tensor(outbuf, inbuf, group=self.cpu_group)
++            t2 = time.perf_counter()
++            output.copy_(outbuf, non_blocking=False)
++            t3 = time.perf_counter()
++            _STAGE_STATS.add(nbytes, (t1 - t0) * 1e3, (t2 - t1) * 1e3,
++                             (t3 - t2) * 1e3)
++            return
++        inbuf.copy_(input_, non_blocking=False)
++        outbuf = self._pinned(output.shape, output.dtype)
++        dist.reduce_scatter_tensor(outbuf, inbuf, group=self.cpu_group)
++        output.copy_(outbuf, non_blocking=False)
++
+     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+         output = input_.clone()
++        if self._needs_staging(output):
++            return self._staged_all_reduce(output)
+         dist.all_reduce(output, group=self.device_group)
+         return output
+ 
+@@ -69,7 +479,11 @@ class XpuCommunicator(DeviceCommunicatorBase):
+             output_shape, dtype=input_tensor.dtype, device=input_tensor.device
+         )
+ 
+-        dist.reduce_scatter_tensor(output, input_tensor, group=self.device_group)
++        if self._needs_staging(input_tensor):
++            self._staged_reduce_scatter(output, input_tensor)
++        else:
++            dist.reduce_scatter_tensor(output, input_tensor,
++                                       group=self.device_group)
+ 
+         # Reshape before returning
+         return output.movedim(0, dim).contiguous()
+@@ -99,7 +513,9 @@ class XpuCommunicator(DeviceCommunicatorBase):
+         output = torch.empty(
+             output_shape, dtype=input_tensor.dtype, device=input_tensor.device
+         )
+-        if sizes is not None and sizes.count(sizes[0]) != len(sizes):
++        if self._needs_staging(input_tensor):
++            self._staged_reduce_scatter(output, input_tensor)
++        elif sizes is not None and sizes.count(sizes[0]) != len(sizes):
+             # if inputs shape in different ranks is not the same using reduce_scatter
+             input_splits = list(input_tensor.split(sizes, dim=0))
+             dist.reduce_scatter(output, input_splits, group=self.device_group)
+@@ -138,7 +554,9 @@ class XpuCommunicator(DeviceCommunicatorBase):
+                 output_size, dtype=input_.dtype, device=input_.device
+             )
+ 
+-            if sizes is not None:
++            if self._needs_staging(input_):
++                self._staged_all_gather(output_tensor, input_)
++            elif sizes is not None:
+                 all_gather_list = []
+                 for size in sizes:
+                     all_gather_list.append(
+@@ -179,7 +597,11 @@ class XpuCommunicator(DeviceCommunicatorBase):
+             (self.world_size,) + input_size, dtype=input_.dtype, device=input_.device
+         )
+         # All-gather.
+-        dist.all_gather_into_tensor(output_tensor, input_, group=self.device_group)
++        if self._needs_staging(input_):
++            self._staged_all_gather(output_tensor, input_)
++        else:
++            dist.all_gather_into_tensor(output_tensor, input_,
++                                        group=self.device_group)
+         if self.rank_in_group == dst:
+             # Reshape
+             output_tensor = output_tensor.movedim(0, dim)
+@@ -193,7 +615,29 @@ class XpuCommunicator(DeviceCommunicatorBase):
+         return output_tensor
+ 
+     def broadcast(self, input_: torch.Tensor, src: int = 0) -> None:
+-        dist.broadcast(input_, src=src, group=self.device_group)
++        if self._needs_staging(input_):
++            buf = self._pinned(input_.shape, input_.dtype)
++            if _STAGE_TIMING:
++                nbytes = input_.numel() * input_.element_size()
++                t0 = time.perf_counter()
++                if self.rank_in_group == src:
++                    buf.copy_(input_, non_blocking=False)
++                t1 = time.perf_counter()
++                dist.broadcast(buf, src=src, group=self.cpu_group)
++                t2 = time.perf_counter()
++                if self.rank_in_group != src:
++                    input_.copy_(buf, non_blocking=False)
++                t3 = time.perf_counter()
++                _STAGE_STATS.add(nbytes, (t1 - t0) * 1e3, (t2 - t1) * 1e3,
++                                 (t3 - t2) * 1e3)
++                return
++            if self.rank_in_group == src:
++                buf.copy_(input_, non_blocking=False)
++            dist.broadcast(buf, src=src, group=self.cpu_group)
++            if self.rank_in_group != src:
++                input_.copy_(buf, non_blocking=False)
++        else:
++            dist.broadcast(input_, src=src, group=self.device_group)
+ 
+     def dispatch_router_logits(
+         self,
+@@ -254,3 +698,169 @@ class XpuCommunicator(DeviceCommunicatorBase):
+             hidden_states,
+             is_sequence_parallel,
+         )
++
++# --- Host-staged functional collectives -------------------------------------
++# The MTP proposer's hidden-state all-gather is traced by inductor and reaches
++# torch.distributed's python collectives directly, bypassing XpuCommunicator.
++# Wrap the python entry points so large XPU payloads are staged through pinned
++# host memory over the default group's CPU (gloo) backend. TP-only deployments
++# have TP group == WORLD, which is what the staged path uses.
++if _HOST_STAGED:
++    import torch.distributed.distributed_c10d as _c10d
++
++    _pg_world = None
++
++    def _stage_guard(t):
++        return (
++            isinstance(t, torch.Tensor)
++            and t.device.type == "xpu"
++            and t.numel() * t.element_size() >= _HOST_STAGED_MIN_BYTES
++        )
++
++    _cpu_group_cache = None
++
++    def _resolve_cpu_group(group):
++        # The device (xccl) group cannot carry CPU tensors; use the matching
++        # GroupCoordinator's gloo sibling instead.
++        global _cpu_group_cache
++        if _cpu_group_cache is not None:
++            return _cpu_group_cache
++        from vllm.distributed import get_tp_group, get_world_group
++        for gc in (get_tp_group(), get_world_group()):
++            dg = getattr(gc, "device_group", None)
++            if group is None or dg is None or group is dg:
++                _cpu_group_cache = gc.cpu_group
++                return _cpu_group_cache
++        _cpu_group_cache = get_world_group().cpu_group
++        return _cpu_group_cache
++
++    def _wrap_unary(name):
++        orig = getattr(_c10d, name)
++        def wrapped(tensor, *args, **kwargs):
++            if _stage_guard(tensor):
++                if _STAGE_TIMING:
++                    nbytes = tensor.numel() * tensor.element_size()
++                    t0 = time.perf_counter()
++                    cpu = tensor.detach().to("cpu", copy=True)
++                    t1 = time.perf_counter()
++                    kwargs["group"] = _resolve_cpu_group(kwargs.pop("group", None))
++                    orig(cpu, *args, **kwargs)
++                    t2 = time.perf_counter()
++                    tensor.copy_(cpu, non_blocking=False)
++                    t3 = time.perf_counter()
++                    _STAGE_STATS.add(nbytes, (t1 - t0) * 1e3, (t2 - t1) * 1e3,
++                                     (t3 - t2) * 1e3)
++                    return None
++                cpu = tensor.detach().to("cpu", copy=True)
++                kwargs["group"] = _resolve_cpu_group(kwargs.pop("group", None))
++                orig(cpu, *args, **kwargs)
++                tensor.copy_(cpu, non_blocking=False)
++                return None
++            return orig(tensor, *args, **kwargs)
++        setattr(_c10d, name, wrapped)
++        setattr(dist, name, wrapped)
++
++    def _wrap_all_gather_into_tensor():
++        name = "all_gather_into_tensor"
++        orig = getattr(_c10d, name)
++        def wrapped(output, input_, *args, **kwargs):
++            if _stage_guard(input_) or _stage_guard(output):
++                if _STAGE_TIMING:
++                    nbytes = input_.numel() * input_.element_size()
++                    t0 = time.perf_counter()
++                    cpu_in = input_.detach().to("cpu", copy=True)
++                    cpu_out = torch.empty(
++                        (output.shape), dtype=output.dtype, pin_memory=True)
++                    t1 = time.perf_counter()
++                    kwargs["group"] = _resolve_cpu_group(kwargs.pop("group", None))
++                    orig(cpu_out, cpu_in, *args, **kwargs)
++                    t2 = time.perf_counter()
++                    output.copy_(cpu_out, non_blocking=False)
++                    t3 = time.perf_counter()
++                    _STAGE_STATS.add(nbytes, (t1 - t0) * 1e3, (t2 - t1) * 1e3,
++                                     (t3 - t2) * 1e3)
++                    return None
++                cpu_in = input_.detach().to("cpu", copy=True)
++                cpu_out = torch.empty(
++                    (output.shape), dtype=output.dtype, pin_memory=True)
++                kwargs["group"] = _resolve_cpu_group(kwargs.pop("group", None))
++                orig(cpu_out, cpu_in, *args, **kwargs)
++                output.copy_(cpu_out, non_blocking=False)
++                return None
++            return orig(output, input_, *args, **kwargs)
++        setattr(_c10d, name, wrapped)
++        setattr(dist, name, wrapped)
++
++    def _wrap_all_gather():
++        name = "all_gather"
++        orig = getattr(_c10d, name)
++        def wrapped(tensor_list, tensor, *args, **kwargs):
++            if _stage_guard(tensor):
++                if _STAGE_TIMING:
++                    nbytes = tensor.numel() * tensor.element_size()
++                    t0 = time.perf_counter()
++                    cpu_in = tensor.detach().to("cpu", copy=True)
++                    cpu_list = [
++                        torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
++                        for t in tensor_list
++                    ]
++                    t1 = time.perf_counter()
++                    kwargs["group"] = _resolve_cpu_group(kwargs.pop("group", None))
++                    orig(cpu_list, cpu_in, *args, **kwargs)
++                    t2 = time.perf_counter()
++                    for t, c in zip(tensor_list, cpu_list):
++                        t.copy_(c, non_blocking=False)
++                    t3 = time.perf_counter()
++                    _STAGE_STATS.add(nbytes, (t1 - t0) * 1e3, (t2 - t1) * 1e3,
++                                     (t3 - t2) * 1e3)
++                    return None
++                cpu_in = tensor.detach().to("cpu", copy=True)
++                cpu_list = [
++                    torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
++                    for t in tensor_list
++                ]
++                kwargs["group"] = _resolve_cpu_group(kwargs.pop("group", None))
++                orig(cpu_list, cpu_in, *args, **kwargs)
++                for t, c in zip(tensor_list, cpu_list):
++                    t.copy_(c, non_blocking=False)
++                return None
++            return orig(tensor_list, tensor, *args, **kwargs)
++        setattr(_c10d, name, wrapped)
++        setattr(dist, name, wrapped)
++
++    def _wrap_reduce_scatter_tensor():
++        name = "reduce_scatter_tensor"
++        orig = getattr(_c10d, name)
++        def wrapped(output, input_, *args, **kwargs):
++            if _stage_guard(input_) or _stage_guard(output):
++                if _STAGE_TIMING:
++                    nbytes = input_.numel() * input_.element_size()
++                    t0 = time.perf_counter()
++                    cpu_in = input_.detach().to("cpu", copy=True)
++                    cpu_out = torch.empty(
++                        output.shape, dtype=output.dtype, pin_memory=True)
++                    t1 = time.perf_counter()
++                    kwargs["group"] = _resolve_cpu_group(kwargs.pop("group", None))
++                    orig(cpu_out, cpu_in, *args, **kwargs)
++                    t2 = time.perf_counter()
++                    output.copy_(cpu_out, non_blocking=False)
++                    t3 = time.perf_counter()
++                    _STAGE_STATS.add(nbytes, (t1 - t0) * 1e3, (t2 - t1) * 1e3,
++                                     (t3 - t2) * 1e3)
++                    return None
++                cpu_in = input_.detach().to("cpu", copy=True)
++                cpu_out = torch.empty(
++                    output.shape, dtype=output.dtype, pin_memory=True)
++                kwargs["group"] = _resolve_cpu_group(kwargs.pop("group", None))
++                orig(cpu_out, cpu_in, *args, **kwargs)
++                output.copy_(cpu_out, non_blocking=False)
++                return None
++            return orig(output, input_, *args, **kwargs)
++        setattr(_c10d, name, wrapped)
++        setattr(dist, name, wrapped)
++
++    _wrap_unary("all_reduce")
++    _wrap_all_gather()
++    _wrap_all_gather_into_tensor()
++    _wrap_reduce_scatter_tensor()
++    logger.info("host-staged functional collectives installed")
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index e81913f928..61ecc898fb 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -4,6 +4,7 @@
+ import functools
+ import gc
+ import itertools
++import os
+ import threading
+ import time
+ from collections import defaultdict
+@@ -1630,6 +1631,18 @@ class GPUModelRunner(
+         num_reqs = output_token_ids.size(0)
+         self.num_accepted_tokens.gpu[:num_reqs] = (output_token_ids != -1).sum(dim=1)
+ 
++        if os.environ.get("VLLM_XPU_VERIFY_TRACE", "0") == "1":
++            _acc = (output_token_ids != -1).sum(dim=1).cpu().tolist()
++            _row = output_token_ids.cpu().tolist()
++            _drafts = {}
++            for _rid, _tok in scheduler_output.scheduled_spec_decode_tokens.items():
++                _drafts[str(_rid)] = [int(x) for x in _tok]
++            print(
++                "[verify-trace] num_reqs=%d accepted=%s row=%s drafts=%s"
++                % (num_reqs, _acc, _row, _drafts),
++                flush=True,
++            )
++
+         if self.cache_config.mamba_cache_mode == "align":
+             # Fused GPU postprocess: state copies + per-request accepted-token
+             # update without CPU-GPU sync. The metadata
+@@ -3614,6 +3627,7 @@ class GPUModelRunner(
+         dict[str, Any],
+         ECConnectorOutput | None,
+     ]:
++        self._xpu_t_fwd_start = time.perf_counter()
+         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+         is_first_rank = get_pp_group().is_first_rank
+         is_encoder_decoder = self.model_config.is_encoder_decoder
+@@ -4559,6 +4573,7 @@ class GPUModelRunner(
+                 **model_kwargs,
+             )
+ 
++        self._xpu_t_fwd = time.perf_counter()
+         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
+             if self.use_aux_hidden_state_outputs:
+                 # True when EAGLE 3 is used.
+@@ -4705,6 +4720,7 @@ class GPUModelRunner(
+                     sampler_output.sampled_token_ids
+                 )
+ 
++        self._xpu_t_sample = time.perf_counter()
+         self._draft_token_ids = None
+         self._draft_probs = None
+         self._draft_prob_req_ids = None
+@@ -4835,6 +4851,48 @@ class GPUModelRunner(
+                 scheduler_output.total_num_scheduled_tokens,
+             )
+ 
++        if os.environ.get("VLLM_XPU_STEP_TIMING", "0") == "1":
++            _tb = time.perf_counter()
++            print(
++                "[xpu-step-timing] fwd=%.3fms samp=%.3fms book=%.3fms total=%.3fms"
++                " num_sched=%d spec_tokens=%d"
++                % (
++                    (self._xpu_t_fwd - self._xpu_t_fwd_start) * 1000,
++                    (self._xpu_t_sample - self._xpu_t_fwd) * 1000,
++                    (_tb - self._xpu_t_sample) * 1000,
++                    (_tb - self._xpu_t_fwd_start) * 1000,
++                    scheduler_output.total_num_scheduled_tokens,
++                    sum(len(v) for v in scheduler_output.scheduled_spec_decode_tokens.values()),
++                ),
++                flush=True,
++            )
++            if os.environ.get("VLLM_XPU_STAGE_TIMING", "0") == "1":
++                # Drain the host-staged collective accumulator accumulated
++                # since the previous step (see xpu_communicator). Host-side
++                # counters only; safe under decode graph capture.
++                from vllm.distributed.device_communicators.xpu_communicator import (
++                    get_and_reset_stage_stats,
++                )
++                _sc, _sb, _sd2h, _sgloo, _sh2d = get_and_reset_stage_stats()
++                try:
++                    _rk = get_tp_group().rank_in_group
++                except Exception:
++                    _rk = -1
++                print(
++                    "[xpu-stage-timing] rank=%d calls=%d bytes=%.2fMB"
++                    " d2h=%.2fms gloo=%.2fms h2d=%.2fms staged_total=%.2fms"
++                    % (
++                        _rk,
++                        _sc,
++                        _sb / 1e6,
++                        _sd2h,
++                        _sgloo,
++                        _sh2d,
++                        _sd2h + _sgloo + _sh2d,
++                    ),
++                    flush=True,
++                )
++
+         if draft_after_bookkeeping:
+             # ngram and other speculative decoding methods use the sampled
+             # tokens on the CPU, so they are run after bookkeeping.
+@@ -5499,6 +5557,48 @@ class GPUModelRunner(
+             combined_msg = f"{msg} (original error: {e})"
+             logger.error(combined_msg)
+             raise e
++        if os.environ.get("VLLM_XPU_GDN_BF16", "1").strip().lower() not in (
++            "0", "false", "no", "off"
++        ):
++            # GDN linear-attn projections are the numerically sensitive stateful
++            # path: with them INT8/FP8-quantized, long chain-of-thought degrades
++            # (measured: CoT never closes; BF16 base and the FP16-projection int4
++            # lane close normally). Dequantize them to BF16 in place now that the
++            # model is fully loaded; the kernel path already checks
++            # _xpu_gdn_bf16_weight and runs the BF16 GEMM (see scaled_mm/xpu.py).
++            try:
++                _gdn_converted = 0
++                for _name, _mod in self.model.named_modules():
++                    # W8A16 mode: non-GDN layers are served by the kernel via
++                    # int8_gemm_w8a16 (weights STAY int8); only linear_attn
++                    # keeps the in-place BF16 conversion (quality path).
++                    if "linear_attn" not in _name:
++                        continue
++                    _w = getattr(_mod, "weight", None)
++                    _sc = getattr(_mod, "weight_scale", None)
++                    if _w is None or _w.dtype != torch.int8:
++                        continue
++                    if _sc is None:
++                        continue
++                    with torch.no_grad():
++                        _wbf16 = (
++                            _w.float() * _sc.float().reshape(1, -1)
++                        ).contiguous().to(torch.bfloat16)
++                        _mod.weight = torch.nn.Parameter(_wbf16, requires_grad=False)
++                        _mod._xpu_gdn_bf16_weight = _wbf16
++                        # drop the entire compressed-tensors scheme param set so
++                        # the traced graph has no None/lingering scheme tensors
++                        for _attr in ("weight_scale", "input_scale",
++                                      "input_zero_point", "azp_adj",
++                                      "_xpu_int8_scale"):
++                            if hasattr(_mod, _attr):
++                                setattr(_mod, _attr, None)
++                    _gdn_converted += 1
++                if _gdn_converted:
++                    logger.info("XPU GDN BF16: converted %d linear_attn projections in place", _gdn_converted)
++            except Exception as _e:  # noqa: BLE001
++                logger.warning("XPU GDN BF16 conversion failed: %r", _e)
++
+         logger.info_once(
+             "Model loading took %s GiB memory and %.6f seconds",
+             format_gib(self.model_memory_usage),

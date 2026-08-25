@@ -1,0 +1,4 @@
+# bigPP-fp8 cell l5 tenants 2026-08-24T02:01:12Z
+vram-track tail (MiB used):
+(vram-tracker not running post-reset)
+comfy procs: 0

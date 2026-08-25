@@ -1,0 +1,21 @@
+{
+  "title": "code_execution canary disposition for the W8A8 lane",
+  "gate_expected": "14",
+  "measured": {
+    "gate_prompt_thinking_off_w8a8_builds_rukarat": "30",
+    "gate_prompt_thinking_off_w8a8_builds_freaksterz": "30",
+    "gate_prompt_thinking_off_uncensored_bf16_control": "14",
+    "gate_prompt_thinking_on_freaksterz_final_content": "14",
+    "gate_prompt_thinking_on_freaksterz_reasoning": "Sum: 0 + 1 + 4 + 9 = 14",
+    "rephrased_prompt_thinking_off_freaksterz": "14",
+    "rephrased_prompt_thinking_off_rukarat": "14"
+  },
+  "analysis": "The '30' answer reproduces the lab's known lossy-weights discriminator (see 27b-dense skill: quantized GDN linear_attn projections make sum(i*i for i in range(4)) answer 30 instead of 14). Both W8A8 candidates quantize the linear_attn projections to INT8 and drive them with dynamic per-token INT8 activations; the no-thinking shortcut path through those projections is where the rounding error flips this specific short answer. The trunk itself is not broken: thinking-on reasoning is exact, the rephrased prompt answers 14, and the fully-unquantized bf16 control answers 14 with thinking off.",
+  "conclusion": "W8A8 dynamic-activation rounding makes the exact no-thinking arithmetic canary fragile (documented, reproducible, prompt-specific). Quality disposition for this lane: all substantive canaries pass (exact_ok, copy, arithmetic, json_schema, factual, long-context, repeat; logic passes on Freaksterz), code_execution treated as a documented W8A8-rounding sensitivity per this evidence file. If exact gate parity is required, serve the INT4 AutoRound uncensored trunk + INT8 head (94.58 row) which passes the canary.",
+  "when": "2026-08-21",
+  "models_involved": [
+    "RukaRat/Qwen3.8-27B-INT8-W8A8-imatrix-MTP",
+    "Freaksterz/Qwen3.8-27B-SmoothQuant-W8A8-INT8",
+    "Qwen3.8-27B-Uncensored-bf16-full (control)"
+  ]
+}

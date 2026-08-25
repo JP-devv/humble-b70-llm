@@ -1,0 +1,96 @@
+{
+  "model": "Qwen3.8-27B-INT8-W8A8",
+  "effort": "medium",
+  "when": "2026-08-21T14:20:33Z",
+  "wifi_cells": [
+    {
+      "closed": true,
+      "cjk": false,
+      "runaway": false,
+      "content_len": 1742,
+      "reason_len": 1223,
+      "t": 18.5
+    },
+    {
+      "closed": true,
+      "cjk": false,
+      "runaway": false,
+      "content_len": 1652,
+      "reason_len": 1586,
+      "t": 19.9
+    },
+    {
+      "closed": true,
+      "cjk": false,
+      "runaway": false,
+      "content_len": 1973,
+      "reason_len": 1084,
+      "t": 17.2
+    },
+    {
+      "closed": true,
+      "cjk": false,
+      "runaway": false,
+      "content_len": 1722,
+      "reason_len": 587,
+      "t": 13.3
+    },
+    {
+      "closed": true,
+      "cjk": false,
+      "runaway": false,
+      "content_len": 1784,
+      "reason_len": 1451,
+      "t": 20.2
+    }
+  ],
+  "needle_16k": {
+    "found": true,
+    "t": 17.9
+  },
+  "agentic_turns": [
+    {
+      "closed": true,
+      "cjk": false,
+      "runaway": false,
+      "len": 857,
+      "t": 8.6
+    },
+    {
+      "closed": true,
+      "cjk": false,
+      "runaway": false,
+      "len": 1482,
+      "t": 12.7
+    },
+    {
+      "closed": true,
+      "cjk": false,
+      "runaway": false,
+      "len": 1747,
+      "t": 13.4
+    },
+    {
+      "closed": true,
+      "cjk": false,
+      "runaway": false,
+      "len": 1752,
+      "t": 14.8
+    },
+    {
+      "closed": true,
+      "cjk": false,
+      "runaway": false,
+      "len": 1573,
+      "t": 14.5
+    },
+    {
+      "closed": true,
+      "cjk": false,
+      "runaway": false,
+      "len": 1490,
+      "t": 15.1
+    }
+  ],
+  "gate_passed": true
+}
