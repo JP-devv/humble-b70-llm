@@ -17,6 +17,7 @@ Every JSON here was produced by `scripts/bench-strict.py` /
 | `quality-fp16-head.json` | Quality gate, FP16 head (baseline parity) |
 | `quality-int8-head.json` | Quality gate, INT8 head (identical pass set) |
 | `methodology-lesson-alternative-stack-cold.json` | Cold run of an alternative serving stack/checkpoint combination (~51 tok/s on the same card): shows that stack and checkpoint choice dominates the number — protocol alone does not explain cross-stack gaps |
+<<<<<<< HEAD
 | `tp2-mtp3-w8a8-int8head-63.64.json` | **W8A8 quality-config row**: genuine INT8 W8A8 trunk (RukaRat imatrix), dynamic per-token activations, TP2 MTP3, INT8 lm_head. Quality valid under the documented dispositions below. |
 | `tp2-mtp3-w8a8-imatrix-int8head-60.70.json` | Same config, earlier run (run-to-run variance; 63.64 is the confirm row) |
 | `tp2-mtp3-w8a8-fzsmoothquant-int8head-57.79.json` / `tp2-mtp3-w8a8-fzsmoothquant-fp16head-53.40.json` | Freaksterz SmoothQuant W8A8: INT8 head gains +4.4 tok/s (+8.2%) over FP16 head with identical quality |
@@ -25,6 +26,9 @@ Every JSON here was produced by `scripts/bench-strict.py` /
 | `quality-w8a8-codeexec-disposition.json` | Evidence for the `code_execution` canary on the censored-base W8A8 lane: the exact gate prompt answers `30` with thinking off (base-lineage behavior, reproduced on two independent quantizations and disproven as a serving regression), `14` with thinking on or rephrasing, `14` on the uncensored bf16 control |
 
 W8A8 lane note (2026-08-21): TP2 TP1 is memory-infeasible on 32 GB cards (27 GB int8 trunk + head + MTP exceeds the budget at load); TP2 is required. Warm 633-token stream measured 56.4 tok/s (post-first, greedy, 5 iter) vs the FP8-W8A8 mode's 66.3 cold / 68.7 warm: the pure-INT8 lane trails FP8 on speed and is carried as the quality/lineage lane; the throughput record remains INT4-trunk + INT8 head (94.58 cold / 105.6 lmx). The W8A8 trunk reads 2x the INT4 trunk's bytes per decode step, so it lands at ~64 cold (TP2) — promoted as the **quality config** (highest-fidelity weights + INT8 dynamic activations, `logic` canary passes on SmoothQuant) while the throughput record stays INT4-trunk + INT8-head (94.58).
+=======
+| `qwen38-unc-fp8-load-w8a8-strict.json` | FP8 UNC variant (load-time W8A8, INT8 head, FP8 KV): cold 66.3 tok/s; see [docs/fp8-unc.md](../../docs/fp8-unc.md) |
+>>>>>>> 6ea4c94 (feat(fp8): UNC FP8 W8A8 variant - serve.sh --quant/--template flags, recipe + memory analysis, measured rows (cold 66.3, lmx 68.7), evidence JSON)
 
 Run-to-run variance is expected; compare within the tolerance band
 (`scripts/bench-strict.sh` does this automatically).

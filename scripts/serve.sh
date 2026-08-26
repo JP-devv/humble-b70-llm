@@ -9,15 +9,18 @@
 #   --kv [fp8]     fp8 KV for long-context capacity
 #   --port N       (default 19622)
 #   --gpu N        single-GPU selection when --tp 1 (default 0)
+#   --quant Q      quantization method: gptq (default) | fp8 (W8A8, load-time)
+#   --template F   path to a chat template to import via --chat-template
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TP=2; MTP=3; INT8=on; CTX=8192; KV=; PORT=19622; GPU=0
+TP=2; MTP=3; INT8=on; CTX=8192; KV=; PORT=19622; GPU=0; QUANT=gptq; TEMPLATE=
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --tp) TP="$2"; shift 2;; --mtp) MTP="$2"; shift 2;;
     --int8-head) INT8="$2"; shift 2;; --ctx) CTX="$2"; shift 2;;
     --kv) KV="$2"; shift 2;; --port) PORT="$2"; shift 2;;
-    --gpu) GPU="$2"; shift 2;; *) echo "unknown: $1"; exit 2;;
+    --gpu) GPU="$2"; shift 2;; --quant) QUANT="$2"; shift 2;;
+    --template) TEMPLATE="$2"; shift 2;; *) echo "unknown: $1"; exit 2;;
   esac
 done
 
@@ -54,7 +57,8 @@ exec env "${envs[@]}" \
   --dtype float16 \
   --max-model-len "$CTX" \
   --max-num-seqs 1 --max-num-batched-tokens 8192 \
-  --quantization gptq \
+  --quantization "$QUANT" \
+  ${TEMPLATE:+--chat-template "$TEMPLATE"} \
   ${KV:+--kv-cache-dtype "$KV"} \
   ${KV:+--gpu-memory-utilization 0.88} \
   --enable-prompt-tokens-details \

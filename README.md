@@ -51,6 +51,22 @@ TTFT (the in-repo harness, contract in
 | 2x B70 (TP2), MTP3, FP16 KV, stock FP16 head | 81.81 | [json](bench/reference/tp2-mtp3-fp16-head-81.81.json) |
 | 1x B70, MTP3, FP16 KV, **INT8 LM head** | **66.84** | [json](bench/reference/tp1-mtp3-int8-head-66.84.json) |
 
+### FP8 UNC variant (load-time W8A8) — full-precision lineage
+
+Same 27B dense, served from the full-precision **uncensored** bf16 base
+(`JonathanColetti/Qwen3.8-27B-Uncensored`) with weights quantized to FP8 e4m3
+(dynamic-act) **at load**, plus the INT8 lm_head and FP8 KV. Motivation: no
+INT4 group-size artifacts (full-bf16 lineage) at native 262144 context; decode
+is the tradeoff (FP8 reads 2x the weight bytes of INT4).
+
+| Serving config | Decode (tok/s, cold) | LocalMaxxing | TTFT |
+| --- | ---: | ---: | ---: |
+| 2x B70 (TP2), FP8 W8A8 load-time, INT8 head, FP8 KV | **66.3** | 68.7 (`cmt2a84b70cp3mv0161xvsnfh`) | ~317-371 ms |
+
+Recipe, memory analysis (why FP8 KV is mandatory at 262144), first-touch
+prewarm caveat and evidence: [docs/fp8-unc.md](docs/fp8-unc.md), reference
+JSON [bench/reference/qwen38-unc-fp8-load-w8a8-strict.json](bench/reference/qwen38-unc-fp8-load-w8a8-strict.json).
+
 The INT8 LM head (W8A8, quantized at load) is the key optimization:
 **+15.6% decode with quality gates unchanged.** How and why it works is in
 [docs/optimizations.md](docs/optimizations.md) — including the things that
@@ -186,9 +202,14 @@ single listed GPU):
 ```text
 patches/          source deltas vs pinned upstream (vllm, vllm-xpu-kernels)
 scripts/          setup-host / build / serve / bench / quality / verify
+<<<<<<< HEAD
 bench/            the exact harness + reference evidence
 docs/             hardware, drivers, metrics contract, optimizations, attempts, troubleshooting, w8a8 campaign
 regressions/      dated regression tests + evidence (w8a8 thinking/decode campaign)
+=======
+bench/            the exact harness + reference evidence (incl. the FP8 UNC cold row)
+docs/             hardware, drivers, metrics contract, optimizations, attempts, troubleshooting, fp8-unc
+>>>>>>> 6ea4c94 (feat(fp8): UNC FP8 W8A8 variant - serve.sh --quant/--template flags, recipe + memory analysis, measured rows (cold 66.3, lmx 68.7), evidence JSON)
 ```
 
 ## License and provenance
